@@ -1,0 +1,17 @@
+[package]
+name = "emergence-engine"
+description = "Hierarchical packet-routing network simulation."
+readme = "../../README.md"
+keywords = ["simulation", "network", "gamedev"]
+categories = ["simulation", "game-development"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# Keep this crate free of UI/engine dependencies: it must build and ship on its own.
+[dependencies]
+
+[lints]
+workspace = true

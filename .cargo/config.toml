@@ -1,0 +1,7 @@
+[alias]
+# `cargo xtask <command>` runs the workspace build tasks (see xtask/src/main.rs).
+xtask = "run -q -p xtask --"
+# `cargo sandbox` builds the native library and runs the test UI against it.
+sandbox = "run -q -p xtask -- sandbox"
+# `cargo check-all` runs clippy on every crate and target, with warnings as errors.
+check-all = "clippy --workspace --all-targets -- -D warnings"

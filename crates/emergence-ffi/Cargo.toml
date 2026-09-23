@@ -1,0 +1,20 @@
+[package]
+name = "emergence-ffi"
+description = "C ABI for the Emergence Engine, for Unity, Unreal and other native hosts."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+# Output is libemergence.dylib / emergence.dll / libemergence.so (+ static libs for Unreal/consoles).
+name = "emergence"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+emergence-engine.workspace = true
+
+[lints]
+workspace = true

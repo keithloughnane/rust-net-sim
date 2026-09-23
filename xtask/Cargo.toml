@@ -1,0 +1,14 @@
+[package]
+name = "xtask"
+description = "Build automation for this workspace (run with `cargo xtask`)."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cbindgen = "0.29.4"
+csbindgen = "1.9.8"
+
+[lints]
+workspace = true

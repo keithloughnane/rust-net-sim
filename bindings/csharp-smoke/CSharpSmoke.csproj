@@ -1,0 +1,21 @@
+<!-- Compiles the Unity bindings outside Unity and runs them against the real native library.
+     Run with `cargo xtask test-csharp`, which passes EmergenceNativeLib. -->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <!-- Match Unity's C# version so bindings that compile here also compile in Unity. -->
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../unity/Runtime/**/*.cs" />
+    <None Include="$(EmergenceNativeLib)" Condition="'$(EmergenceNativeLib)' != ''"
+          CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+
+</Project>

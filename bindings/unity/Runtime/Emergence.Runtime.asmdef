@@ -1,0 +1,7 @@
+{
+  "name": "Emergence.Runtime",
+  "rootNamespace": "Emergence",
+  "allowUnsafeCode": true,
+  "autoReferenced": true,
+  "noEngineReferences": true
+}

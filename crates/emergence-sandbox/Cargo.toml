@@ -1,0 +1,17 @@
+[package]
+name = "emergence-sandbox"
+description = "Interactive test harness for the Emergence Engine."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+eframe.workspace = true
+# Loads the engine as a native library, exactly like Unity/Unreal do.
+libloading = "0.8.9"
+
+[lints]
+workspace = true

@@ -1,7 +1,33 @@
-[package]
-name = "rust-net-sim"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "3"
+members = ["crates/emergence-engine", "crates/emergence-ffi", "crates/emergence-sandbox", "xtask"]
+# Plain `cargo build` / `cargo test` in the root only touch the library.
+# Use `cargo sandbox` (alias in .cargo/config.toml) to run the UI.
+default-members = ["crates/emergence-engine", "crates/emergence-ffi"]
 
-[dependencies]
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+authors = ["Keith Loughnane"]
+repository = "https://github.com/keithloughnane/rust-net-sim"
+
+[workspace.dependencies]
+emergence-engine = { path = "crates/emergence-engine", version = "0.1.0" }
 eframe = "0.32"
+
+[workspace.lints.rust]
+# `deny`, not `forbid`, so the FFI boundary crates can opt in explicitly. The engine forbids it.
+unsafe_code = "deny"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+lto = "thin"
