@@ -28,6 +28,29 @@ used from Unity (C#), Unreal (C++) or any other engine.
   packets move one hop per tick, the same inputs always give the same result, and a tick
   always finishes. `drain_trace()` reports what happened (sent, delivered, dropped, notes).
 
+### Safety: monitor and fuse
+
+Runaway networks (loops, replay storms, amplification, floods) have crashed Unity and whole
+machines before, so the engine has two layers of defence:
+
+- **Monitor** (`MonitorConfig`): observes and raises `Alert`s (warning or error) into the trace.
+  Checks: network, link and node rate; TTL expiry (a loop has happened); relay cycle (a loop
+  *will* happen, found from the topology before any traffic); replay (the same packet over and
+  over); amplification (one packet in, many out); logic panicked. Alerts are de-duplicated so
+  they cannot flood the trace themselves.
+- **Fuse** (`Limits`): hard per-tick limits on packets sent, packets delivered, queue size and
+  payload size. A tick that hits one stops delivering, keeps the rest queued, and returns
+  `TickOutcome::FuseTripped` (`EMERGENCE_STATUS_FUSE_TRIPPED` over the C ABI) with a
+  `FuseReport`: the limit, the busiest senders and links, and the latest alert from each check,
+  earliest (usually the root cause) first. The library only reports; the host decides what to do.
+  The sandbox pauses the world and shows the report. Even a host that ignores the fuse and keeps
+  ticking stays within the limits.
+
+Also: logic that panics is removed and reported instead of taking the world down, packets share
+their payload instead of copying it to every listener, trace and replay memory are bounded, and
+names are validated. Names can't be empty or reserved, can't contain `@` or `/`, and can't clash
+with another node on the same link. Every computer can still have its own `registry`.
+
 ### Routing
 
 A node accepts a packet on a link if it is addressed to it or to everyone (`*`), if a child
@@ -90,12 +113,52 @@ time:
   ↓received` counts.
 - **Traffic log** (bottom): one line per packet, with who accepted it and why (gateway, child to
   parent), drops, and notes from logic. It can be filtered to the selected node.
+- **Alerts** (bottom tab, plus `!` badges on the canvas): everything the monitor raised.
+- **Fuse**: when a tick hits a hard limit, the world pauses and a banner explains why. Use
+  *Limits…* in the toolbar to try different limits live.
+- **Tests** (bottom tab): the stress-test checklist. Run one test or all of them on a background
+  thread and see every check pass or fail. *Watch* loads a test's network into the viewer,
+  paused, so you can step through exactly what it does.
 - **Controls**: play/pause (Space), step one tick, and speed. The inspector can change a node's
   logic and send events from it: one click pings everyone on a link, or fill in a route such
   as `pc-manager@office-wifi/fileman@ipc`.
 - Scroll to zoom, drag the background to pan, drag an item to move and pin it, Esc to go up.
 
-Test networks live in `crates/emergence-sandbox/src/scenarios.rs`.
+Test networks live in `crates/emergence-sandbox/src/scenarios.rs`. Stress tests live in
+`crates/emergence-sandbox/src/stress.rs`, grouped as healthy traffic (no false alarms), loops,
+replay and amplification, floods and limits, player edits (bad names, clashes, unplugging
+mid-flight, 2,000-deep nesting, 20,000 nodes, odd addresses), and robustness (crashing logic,
+determinism). `cargo test --workspace` runs the whole catalogue against the real library. To add
+a case, add an entry to `ALL` with a `setup` (build the network) and a `verify` (run and check).
+
+Deliberately broken logic kinds exist for these tests and are marked as faulty in the UI:
+`echo`, `replayer`, `amplifier`, `flooder`, `crasher`.
+
+### Driving the sandbox from a terminal
+
+While `cargo sandbox` is open, `cargo ctl` drives the same window from another terminal (or a
+script, or an AI assistant). Everything happens visibly in the window, and the results print
+in the terminal:
+
+```sh
+cargo ctl status                        # what is loaded, tick, load, alerts, fuse, tests
+cargo ctl load office                   # switch scenario
+cargo ctl step 30                       # run 30 ticks now and summarise them
+cargo ctl open pc-manager               # move the canvas inside a node
+cargo ctl send laptop office-wifi "pc-manager@office-wifi/fileman@ipc" ping hello
+cargo ctl log 10                        # the last traffic lines
+cargo ctl watch four bridges            # load a stress test's network, paused
+cargo ctl step 20                       # stops early, and explains, if the fuse trips
+cargo ctl run                           # run the whole checklist and print the results
+cargo ctl screenshot window.png         # save a picture of the window
+cargo ctl help                          # every command
+```
+
+Add `--json` to any command for structured output. The exit code is non-zero when a command
+fails (including `run` with failing tests), so it works in scripts and CI. The control port
+listens on 127.0.0.1:47474 only; set `EMERGENCE_CONTROL_PORT` to use another port, or 0 to turn
+it off. The protocol is one JSON object per line (see
+`crates/emergence-sandbox/src/control.rs`).
 
 Environment variables for scripted runs:
 
@@ -105,6 +168,11 @@ Environment variables for scripted runs:
 | `EMERGENCE_SCENARIO` | Start with this scenario, e.g. `Mesh`. |
 | `EMERGENCE_OPEN` | Start inside the first node with this name, e.g. `pc-manager`. |
 | `EMERGENCE_SPEED` | Start at this many ticks per second. |
+| `EMERGENCE_WATCH` | Start by watching this stress test, e.g. `Firehose`. |
+| `EMERGENCE_PLAY` | Start playing even when watching a test. |
+| `EMERGENCE_TAB` | Start on the `traffic`, `alerts` or `tests` tab. |
+| `EMERGENCE_RUN_TESTS` | Run the whole stress-test checklist at startup. |
+| `EMERGENCE_SCREENSHOT_FRAMES` | Frames to wait before the screenshot (default 150). |
 | `EMERGENCE_SCREENSHOT` | Save a PNG of the window once the layout settles, then quit. |
 
 ## Using the library
@@ -128,8 +196,9 @@ Environment variables for scripted runs:
    world.SetLogic(pc, "responder");
 
    world.Send(laptop, "wifi-1", "pc-1@wifi-1", "ping");
-   world.Tick(); // pc-1 gets the ping and answers
-   world.Tick(); // laptop gets the pong
+   if (world.Tick() == TickOutcome.FuseTripped)   // pc-1 gets the ping and answers
+       Debug.LogError(world.FuseReportJson());    // the last line of defence: pause and look
+   world.Tick();                                  // laptop gets the pong
    Debug.Log(world.DrainTraceJson());
    ```
 

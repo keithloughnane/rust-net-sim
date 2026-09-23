@@ -6,11 +6,16 @@
 
 mod activity;
 mod capture;
+mod control;
 mod graph_view;
+mod health;
 mod native;
+mod remote;
 mod scenarios;
 mod snapshot;
+mod stress;
 mod style;
+mod tests_panel;
 mod trace;
 
 use std::sync::Arc;
@@ -18,7 +23,7 @@ use std::sync::Arc;
 use activity::Activity;
 use eframe::egui::{self, RichText, collapsing_header::CollapsingState};
 use graph_view::{GraphView, Item, ViewAction};
-use native::{LinkId, NativeLibrary, NativeWorld, NodeId};
+use native::{LinkId, NativeLibrary, NativeWorld, NodeId, TickResult};
 use snapshot::Snapshot;
 
 fn main() -> eframe::Result {
@@ -34,7 +39,10 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
-            Ok(Box::new(SandboxApp::new(capture::Options::from_env())))
+            Ok(Box::new(SandboxApp::new(
+                &capture::Options::from_env(),
+                &cc.egui_ctx,
+            )))
         }),
     )
 }
@@ -118,10 +126,31 @@ struct SandboxApp {
     send_form: SendForm,
     /// The last error from ticking or a command, shown in the toolbar.
     sim_error: Option<String>,
+    health: health::Health,
+    /// Set when the fuse trips; shown as a banner until dismissed.
+    fuse: Option<health::FuseReport>,
+    bottom_tab: BottomTab,
+    tests: tests_panel::TestsPanel,
+    /// The stress test loaded into the viewer, instead of a scenario.
+    watching: Option<usize>,
+    /// The fuse-limits editor, while open.
+    limits_edit: Option<health::Limits>,
+    /// Lets `emergence-ctl` drive this window.
+    control: Option<control::ControlServer>,
+    /// Why the control port is not available, if it is not.
+    control_problem: Option<String>,
+    deferred: remote::Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BottomTab {
+    Traffic,
+    Alerts,
+    Tests,
 }
 
 impl SandboxApp {
-    fn new(options: capture::Options) -> Self {
+    fn new(options: &capture::Options, ctx: &egui::Context) -> Self {
         let library =
             NativeLibrary::load(&NativeLibrary::default_path()).map_err(|e| e.to_string());
         let mut app = Self {
@@ -133,13 +162,55 @@ impl SandboxApp {
             reveal_in_tree: false,
             tree_scope: None,
             graph: GraphView::default(),
-            capture: options.screenshot.map(capture::Capture::new),
+            capture: options
+                .screenshot
+                .clone()
+                .map(|p| capture::Capture::new(p, options.frames)),
             clock: Clock::default(),
             activity: Activity::default(),
             log_only_selected: false,
             send_form: SendForm::default(),
             sim_error: None,
+            health: health::Health::default(),
+            fuse: None,
+            bottom_tab: BottomTab::Traffic,
+            tests: tests_panel::TestsPanel::default(),
+            watching: None,
+            limits_edit: None,
+            control: None,
+            control_problem: None,
+            deferred: remote::Deferred::default(),
         };
+        let port = std::env::var("EMERGENCE_CONTROL_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(control::DEFAULT_PORT);
+        if port == 0 {
+            app.control_problem = Some("turned off (EMERGENCE_CONTROL_PORT=0)".into());
+        } else {
+            match control::ControlServer::start(port, ctx.clone()) {
+                Ok(server) => app.control = Some(server),
+                Err(e) => app.control_problem = Some(format!("port {port} unavailable: {e}")),
+            }
+        }
+        if let Some(name) = &options.watch {
+            app.watching = stress::ALL
+                .iter()
+                .position(|t| t.name.eq_ignore_ascii_case(name));
+        }
+        if let Some(tab) = &options.tab {
+            app.bottom_tab = match tab.as_str() {
+                "alerts" => BottomTab::Alerts,
+                "tests" => BottomTab::Tests,
+                _ => BottomTab::Traffic,
+            };
+        }
+        if options.run_tests
+            && let Ok(library) = &app.library
+        {
+            let all = (0..stress::ALL.len()).collect();
+            app.tests.run(library, all);
+        }
         if let Some(speed) = options.speed {
             app.clock.ticks_per_second = speed;
         }
@@ -150,6 +221,9 @@ impl SandboxApp {
                 .unwrap_or(0);
         }
         app.build();
+        if options.play {
+            app.clock.playing = true;
+        }
         if let (Some(name), Ok(loaded)) = (&options.open, &app.loaded) {
             app.scope = loaded.snapshot.find_node(name).or(app.scope);
         }
@@ -163,15 +237,28 @@ impl SandboxApp {
         self.activity.clear();
         self.clock.owed = 0.0;
         self.sim_error = None;
+        self.fuse = None;
         let Ok(library) = &self.library else { return };
+        let (name, watching) = match self.watching {
+            Some(i) => (stress::ALL[i].name, Some(stress::ALL[i])),
+            None => (scenarios::ALL[self.scenario].name, None),
+        };
         let scenario = scenarios::ALL[self.scenario];
         self.loaded = NativeWorld::new(library.clone())
             .and_then(|mut world| {
-                scenario.build(&mut world)?;
+                match watching {
+                    Some(test) => test.setup(&mut world)?,
+                    None => scenario.build(&mut world)?,
+                }
                 let snapshot = world.snapshot()?;
+                self.health = world.health()?;
                 Ok(Loaded { world, snapshot })
             })
-            .map_err(|e| format!("Building “{}” failed: {e}", scenario.name));
+            .map_err(|e| format!("Building “{name}” failed: {e}"));
+        if watching.is_some() {
+            // Tests are for stepping through: start paused.
+            self.clock.playing = false;
+        }
         self.scope = self.loaded.as_ref().ok().map(|l| l.snapshot.root());
     }
 
@@ -190,8 +277,6 @@ impl SandboxApp {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("Emergence Sandbox");
-            ui.separator();
             let before = self.scenario;
             egui::ComboBox::from_id_salt("scenario")
                 .selected_text(scenarios::ALL[self.scenario].name)
@@ -203,8 +288,15 @@ impl SandboxApp {
                 })
                 .response
                 .on_hover_text(scenarios::ALL[self.scenario].description);
+            if before != self.scenario {
+                self.watching = None;
+            }
             if ui.button("⟲ Rebuild").clicked() || before != self.scenario {
                 self.build();
+            }
+            if let Some(i) = self.watching {
+                ui.colored_label(style::WARN, format!("Watching test: {}", stress::ALL[i].name))
+                    .on_hover_text(stress::ALL[i].description);
             }
             ui.separator();
 
@@ -232,6 +324,27 @@ impl SandboxApp {
             );
             if let Ok(loaded) = &self.loaded {
                 ui.monospace(format!("tick {}", loaded.snapshot.tick()));
+                let h = &self.health;
+                let load = h.transmissions;
+                let max = h.limits.max_transmissions_per_tick.max(1);
+                let color = if load * 2 >= max {
+                    style::DROP
+                } else if load * 10 >= max {
+                    style::WARN
+                } else {
+                    style::TEXT_WEAK
+                };
+                ui.colored_label(color, format!("load {load}/tick"))
+                    .on_hover_text(format!(
+                        "Packets sent last tick. The fuse trips at {max} sent or {} delivered per tick.\nQueued: {} / {}  (refused so far: {})\nPeak: {} per tick\nTTL drops: {}  ·  unplugged drops: {}\nFuse trips: {}\nTrace buffer: {} (lost {})",
+                        h.limits.max_deliveries_per_tick,
+                        h.pending, h.limits.max_pending, h.refused_sends,
+                        h.peak_transmissions, h.ttl_drops, h.sender_left_drops, h.fuse_trips,
+                        h.trace_len, h.trace_discarded
+                    ));
+                if ui.button("Limits…").on_hover_text("Tune the fuse's hard limits").clicked() {
+                    self.limits_edit = Some(self.health.limits.clone());
+                }
             }
             if let Some(e) = &self.sim_error {
                 ui.colored_label(ui.visuals().error_fg_color, e);
@@ -241,6 +354,17 @@ impl SandboxApp {
                 if let Ok(library) = &self.library {
                     ui.weak(format!("libemergence v{}", library.version()))
                         .on_hover_text(library.path().display().to_string());
+                }
+                match (&self.control, &self.control_problem) {
+                    (Some(c), _) => {
+                        ui.weak(format!("ctl :{}", c.port)).on_hover_text(
+                            "Drive this window from a terminal, e.g.\n  cargo ctl status\n  cargo ctl step 10\n  cargo ctl run",
+                        );
+                    }
+                    (None, Some(problem)) => {
+                        ui.weak("ctl off").on_hover_text(problem);
+                    }
+                    (None, None) => {}
                 }
                 if let Ok(loaded) = &self.loaded {
                     ui.separator();
@@ -256,7 +380,9 @@ impl SandboxApp {
 
     /// Runs however many ticks are due, then refreshes the snapshot and the activity view.
     fn advance(&mut self, ctx: &egui::Context) {
-        let Ok(loaded) = &mut self.loaded else { return };
+        if self.loaded.is_err() {
+            return;
+        }
         let clock = &mut self.clock;
         let mut steps = u32::from(std::mem::take(&mut clock.step_requested));
         if clock.playing {
@@ -278,23 +404,48 @@ impl SandboxApp {
         } else {
             0.6
         };
-        let result = (0..steps)
-            .try_for_each(|_| loaded.world.tick())
-            .and_then(|()| {
-                let trace = loaded.world.drain_trace()?;
-                loaded.snapshot = loaded.world.snapshot()?;
-                Ok(trace)
-            });
+        let now = ctx.input(|i| i.time);
+        self.run_ticks(steps, duration, now);
+    }
+
+    /// Runs up to `steps` ticks, stopping early if the fuse trips, then refreshes the snapshot,
+    /// health and activity. Returns how many ticks ran and whether the fuse tripped. On a trip
+    /// the world is paused: the library reported a hard limit, and stopping is the UI's call.
+    fn run_ticks(&mut self, steps: u32, duration: f64, now: f64) -> (u32, bool) {
+        let Ok(loaded) = &mut self.loaded else {
+            return (0, false);
+        };
+        let mut ran = 0;
+        let mut tripped = false;
+        let result = (|| {
+            for _ in 0..steps {
+                ran += 1;
+                if loaded.world.tick()? == TickResult::FuseTripped {
+                    tripped = true;
+                    break;
+                }
+            }
+            let trace = loaded.world.drain_trace()?;
+            loaded.snapshot = loaded.world.snapshot()?;
+            self.health = loaded.world.health()?;
+            if tripped {
+                self.fuse = loaded.world.fuse_report()?;
+            }
+            Ok::<_, native::NativeError>(trace)
+        })();
         match result {
             Ok(trace) => {
-                let now = ctx.input(|i| i.time);
                 self.activity.ingest(&loaded.snapshot, trace, now, duration);
+                if tripped {
+                    self.clock.playing = false;
+                }
             }
             Err(e) => {
                 self.sim_error = Some(e.to_string());
-                clock.playing = false;
+                self.clock.playing = false;
             }
         }
+        (ran, tripped)
     }
 
     fn run_command(&mut self, command: &Command) {
@@ -355,6 +506,7 @@ impl SandboxApp {
                 self.selection,
                 reveal,
                 &mut clicked,
+                0,
             );
         });
         self.reveal_in_tree = false;
@@ -367,7 +519,7 @@ impl SandboxApp {
     fn inspector(&mut self, ui: &mut egui::Ui) {
         let Ok(loaded) = &self.loaded else { return };
         let snap = &loaded.snapshot;
-        let logic_kinds: Vec<String> = self
+        let logic_kinds: Vec<native::LogicKind> = self
             .library
             .as_ref()
             .map(|l| l.logic_kinds().to_vec())
@@ -413,8 +565,15 @@ impl SandboxApp {
                         .selected_text(&chosen)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut chosen, "none".into(), "none");
-                            for kind in &logic_kinds {
-                                ui.selectable_value(&mut chosen, kind.clone(), kind);
+                            for kind in logic_kinds.iter().filter(|k| !k.faulty) {
+                                ui.selectable_value(&mut chosen, kind.name.clone(), &kind.name);
+                            }
+                            ui.separator();
+                            ui.weak("Faulty, for stress testing");
+                            for kind in logic_kinds.iter().filter(|k| k.faulty) {
+                                let text =
+                                    RichText::new(format!("⚠ {}", kind.name)).color(style::DROP);
+                                ui.selectable_value(&mut chosen, kind.name.clone(), text);
                             }
                         });
                     if chosen != current {
@@ -525,6 +684,166 @@ impl SandboxApp {
             });
     }
 
+    /// Lets you try different fuse limits against the running network.
+    fn limits_window(&mut self, ctx: &egui::Context) {
+        let Some(edit) = &mut self.limits_edit else {
+            return;
+        };
+        let mut open = true;
+        let mut apply = false;
+        egui::Window::new("Fuse limits")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.weak("The last line of defence. When a tick reaches one of these, the library\nholds the rest back and the sandbox pauses.");
+                egui::Grid::new("limits").num_columns(2).show(ui, |ui| {
+                    ui.label("Packets sent per tick");
+                    ui.add(egui::DragValue::new(&mut edit.max_transmissions_per_tick).range(1..=10_000_000));
+                    ui.end_row();
+                    ui.label("Deliveries per tick");
+                    ui.add(egui::DragValue::new(&mut edit.max_deliveries_per_tick).range(1..=100_000_000));
+                    ui.end_row();
+                    ui.label("Queued packets");
+                    ui.add(egui::DragValue::new(&mut edit.max_pending).range(1..=10_000_000));
+                    ui.end_row();
+                    ui.label("Payload bytes");
+                    ui.add(egui::DragValue::new(&mut edit.max_payload_bytes).range(1..=16_777_216));
+                    ui.end_row();
+                });
+                apply = ui.button("Apply to this world").clicked();
+            });
+        if apply && let (Some(l), Ok(loaded)) = (&self.limits_edit, &mut self.loaded) {
+            let result = loaded
+                .world
+                .set_limits(
+                    l.max_transmissions_per_tick,
+                    l.max_deliveries_per_tick,
+                    l.max_pending,
+                    l.max_payload_bytes,
+                )
+                .and_then(|()| loaded.world.health());
+            match result {
+                Ok(h) => self.health = h,
+                Err(e) => self.sim_error = Some(e.to_string()),
+            }
+        }
+        if !open || apply {
+            self.limits_edit = None;
+        }
+    }
+
+    fn alerts_list(&mut self, ui: &mut egui::Ui) {
+        let Ok(loaded) = &self.loaded else { return };
+        let snap = &loaded.snapshot;
+        if self.activity.alerts.is_empty() {
+            ui.weak("No alerts. The monitor watches for loops, replays, amplification and floods.");
+            return;
+        }
+        let mut clicked = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for a in &self.activity.alerts {
+                    ui.horizontal(|ui| {
+                        ui.monospace(format!("t{:<6}", a.tick));
+                        ui.colored_label(
+                            style::severity_color(a.severity),
+                            format!("⚠ {}", a.check),
+                        );
+                        match a.subject {
+                            Some(health::Subject::Node(n)) => {
+                                node_button(ui, snap, n, &mut clicked);
+                            }
+                            Some(health::Subject::Link(l)) => {
+                                link_button(ui, snap, l, &mut clicked);
+                            }
+                            None => {
+                                ui.weak("network");
+                            }
+                        }
+                        ui.label(&a.message);
+                    });
+                }
+            });
+        if clicked.is_some() {
+            self.select(clicked, Source::Panel);
+        }
+    }
+
+    /// The last line of defence, made visible: the fuse tripped, the world is paused, and here
+    /// is the library's best explanation of why.
+    fn fuse_banner(&mut self, ui: &mut egui::Ui) {
+        let (Some(report), Ok(loaded)) = (&self.fuse, &self.loaded) else {
+            return;
+        };
+        let snap = &loaded.snapshot;
+        let mut dismiss = false;
+        let mut resume = false;
+        let mut clicked = None;
+        egui::Frame::NONE
+            .fill(style::DROP.gamma_multiply(0.18))
+            .stroke(egui::Stroke::new(1.5_f32, style::DROP))
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("⛔ Last line of defence: the fuse tripped. World paused.")
+                            .color(style::DROP)
+                            .strong(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        dismiss = ui.button("Dismiss").clicked();
+                        resume = ui
+                            .button("Resume anyway")
+                            .on_hover_text("Keep ticking. The fuse will keep holding traffic back each tick it is exceeded.")
+                            .clicked();
+                    });
+                });
+                ui.label(format!(
+                    "Tick {}: hit the limit of {}. {} packets held back.",
+                    report.tick,
+                    report.limit_text(),
+                    report.held_back
+                ));
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak("Busiest senders:");
+                    for &(n, count) in &report.top_senders {
+                        node_button(ui, snap, n, &mut clicked);
+                        ui.weak(format!("({count})"));
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak("Busiest links:");
+                    for &(l, count) in &report.top_links {
+                        link_button(ui, snap, l, &mut clicked);
+                        ui.weak(format!("({count})"));
+                    }
+                });
+                if report.recent_alerts.is_empty() {
+                    ui.weak("No monitor alerts point at a cause.");
+                } else {
+                    ui.weak("Likely causes (earliest first):");
+                    for a in &report.recent_alerts {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(style::severity_color(a.severity), format!("⚠ {}", a.check));
+                            ui.label(format!("tick {}: {}", a.tick, a.message));
+                        });
+                    }
+                }
+            });
+        if clicked.is_some() {
+            self.select(clicked, Source::Panel);
+        }
+        if resume {
+            self.clock.playing = true;
+            self.fuse = None;
+        } else if dismiss {
+            self.fuse = None;
+        }
+    }
+
     fn breadcrumbs(&mut self, ui: &mut egui::Ui) {
         let (Ok(loaded), Some(scope)) = (&self.loaded, self.scope) else {
             return;
@@ -579,10 +898,13 @@ impl SandboxApp {
         let snap = &loaded.snapshot;
         let now = ui.input(|i| i.time);
         self.activity.expire(now);
-        match self
-            .graph
-            .show(ui, snap, scope, self.selection, &self.activity, now)
-        {
+        let marks = self.activity.marks(snap.tick().saturating_sub(100));
+        let overlay = graph_view::Overlay {
+            activity: &self.activity,
+            marks: &marks,
+            now,
+        };
+        match self.graph.show(ui, snap, scope, self.selection, overlay) {
             Some(ViewAction::Select(item)) => self.select(item, Source::Canvas),
             Some(ViewAction::Enter(node)) => self.scope = Some(node),
             Some(ViewAction::Up) => {
@@ -603,6 +925,8 @@ impl eframe::App for SandboxApp {
         if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             self.clock.playing = !self.clock.playing;
         }
+        self.tests.poll(ctx);
+        self.handle_control(ctx);
         self.advance(ctx);
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -640,13 +964,45 @@ impl eframe::App for SandboxApp {
                 ui.separator();
                 self.inspector(ui);
             });
-        egui::TopBottomPanel::bottom("traffic")
+        egui::TopBottomPanel::bottom("bottom")
             .resizable(true)
-            .default_height(180.0)
+            .default_height(220.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
-                self.traffic_log(ui);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.bottom_tab, BottomTab::Traffic, "Traffic");
+                    let alerts = self.activity.alerts.len();
+                    ui.selectable_value(
+                        &mut self.bottom_tab,
+                        BottomTab::Alerts,
+                        format!("Alerts ({alerts})"),
+                    );
+                    let (passed, failed, total) = self.tests.counts();
+                    let label = if self.tests.is_running() {
+                        format!("Tests (running… {passed}/{total})")
+                    } else if failed > 0 {
+                        format!("Tests ({failed} failed)")
+                    } else {
+                        format!("Tests ({passed}/{total})")
+                    };
+                    ui.selectable_value(&mut self.bottom_tab, BottomTab::Tests, label);
+                });
+                ui.separator();
+                match self.bottom_tab {
+                    BottomTab::Traffic => self.traffic_log(ui),
+                    BottomTab::Alerts => self.alerts_list(ui),
+                    BottomTab::Tests => {
+                        let library = self.library.as_ref().ok().cloned();
+                        if let Some(tests_panel::TestAction::Watch(i)) =
+                            self.tests.ui(ui, library.as_ref())
+                        {
+                            self.watching = Some(i);
+                            self.build();
+                        }
+                    }
+                }
             });
+        self.limits_window(ctx);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
@@ -654,6 +1010,7 @@ impl eframe::App for SandboxApp {
                     .inner_margin(egui::Margin::symmetric(8, 6))
                     .fill(ui.visuals().panel_fill)
                     .show(ui, |ui| self.breadcrumbs(ui));
+                self.fuse_banner(ui);
                 self.canvas(ui);
             });
     }
@@ -683,6 +1040,10 @@ fn expand_tree_to(ctx: &egui::Context, snap: &Snapshot, node: NodeId) {
     }
 }
 
+/// Deepest level the hierarchy tree draws. Players can nest thousands deep; drawing every level
+/// recursively would overflow the stack, and nobody reads a tree that deep anyway.
+const MAX_TREE_DEPTH: usize = 40;
+
 fn tree_node(
     ui: &mut egui::Ui,
     snap: &Snapshot,
@@ -690,8 +1051,22 @@ fn tree_node(
     selection: Option<Item>,
     reveal: bool,
     clicked: &mut Option<Item>,
+    depth: usize,
 ) {
     let Some(node) = snap.node(id) else { return };
+    if depth >= MAX_TREE_DEPTH {
+        let hidden = 1 + snap.descendant_count(id);
+        if ui
+            .link(format!(
+                "⋯ {hidden} more nested nodes (open {} on the canvas)",
+                node.name
+            ))
+            .clicked()
+        {
+            *clicked = Some(Item::Node(id));
+        }
+        return;
+    }
     let selected = selection == Some(Item::Node(id));
     let name = if id == snap.root() {
         "world"
@@ -737,7 +1112,7 @@ fn tree_node(
                 });
             }
             for &child in &node.children {
-                tree_node(ui, snap, child, selection, reveal, clicked);
+                tree_node(ui, snap, child, selection, reveal, clicked, depth + 1);
             }
         });
 }

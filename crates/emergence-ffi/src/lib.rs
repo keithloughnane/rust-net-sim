@@ -21,6 +21,7 @@
 
 #![allow(unsafe_code)] // Exporting a C ABI is unsafe by nature; keep it confined to this crate.
 
+mod health;
 mod snapshot;
 mod trace;
 
@@ -29,11 +30,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 
 use emergence_engine::{
-    Event, LOGIC_KINDS, LinkId, LogicError, NetworkError, NodeId, PacketRoute, SendError, World,
+    Event, FAULTY_LOGIC_KINDS, LOGIC_KINDS, Limits, LinkId, LogicError, NetworkError, NodeId,
+    PacketRoute, SendError, TickOutcome, World,
 };
 
 /// Version of the C ABI. Bump whenever an exported signature or type layout changes.
-pub const EMERGENCE_ABI_VERSION: u32 = 3;
+pub const EMERGENCE_ABI_VERSION: u32 = 4;
 
 static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 
@@ -69,12 +71,24 @@ pub enum EmergenceStatus {
     InvalidRoute = 12,
     /// The node is neither subscribed to the link nor its owner, so it cannot send on it.
     NotOnLink = 13,
+    /// A node or link name is empty, too long, reserved, or contains route syntax (`@`, `/`).
+    InvalidName = 14,
+    /// Another node on the same link already has that name, or the node already uses another
+    /// link with that name.
+    NameConflict = 15,
+    /// The send queue is full; the world is overloaded. Nothing was sent.
+    QueueFull = 16,
+    /// The event payload or kind is larger than the limits allow.
+    PayloadTooLarge = 17,
+    /// Not an error: the tick ran, but hit a hard limit and held packets back. The network is
+    /// running away. Pause and read [`emergence_world_fuse_report_json`].
+    FuseTripped = 18,
     /// The operation failed for a reason this ABI version does not have a code for.
     Failed = 255,
 }
 
 impl EmergenceStatus {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 20] = [
         Self::Ok,
         Self::NullPointer,
         Self::Panic,
@@ -89,6 +103,11 @@ impl EmergenceStatus {
         Self::UnknownLogic,
         Self::InvalidRoute,
         Self::NotOnLink,
+        Self::InvalidName,
+        Self::NameConflict,
+        Self::QueueFull,
+        Self::PayloadTooLarge,
+        Self::FuseTripped,
         Self::Failed,
     ];
 
@@ -108,6 +127,11 @@ impl EmergenceStatus {
             Self::UnknownLogic => c"no built-in logic has that name",
             Self::InvalidRoute => c"invalid route",
             Self::NotOnLink => c"the node is not on that link",
+            Self::InvalidName => c"invalid name",
+            Self::NameConflict => c"that name is already used on the same link",
+            Self::QueueFull => c"the send queue is full",
+            Self::PayloadTooLarge => c"the event payload is too large",
+            Self::FuseTripped => c"the fuse tripped: the network hit a hard limit",
             Self::Failed => c"the operation failed",
         }
     }
@@ -123,6 +147,10 @@ impl From<NetworkError> for EmergenceStatus {
             NetworkError::IsRoot => Self::IsRoot,
             NetworkError::LinkOwnedElsewhere(_) => Self::LinkOwnedElsewhere,
             NetworkError::NotAChild(_) => Self::NotAChild,
+            NetworkError::InvalidName(_) => Self::InvalidName,
+            NetworkError::NameConflict { .. } | NetworkError::LinkNameConflict { .. } => {
+                Self::NameConflict
+            }
             _ => Self::Failed,
         }
     }
@@ -145,6 +173,8 @@ impl From<SendError> for EmergenceStatus {
             SendError::UnknownLink(_) => Self::UnknownLink,
             SendError::NotOnLink(_) => Self::NotOnLink,
             SendError::Route(_) => Self::InvalidRoute,
+            SendError::QueueFull => Self::QueueFull,
+            SendError::PayloadTooLarge => Self::PayloadTooLarge,
             _ => Self::Failed,
         }
     }
@@ -321,6 +351,11 @@ pub unsafe extern "C" fn emergence_world_destroy(world: *mut EmergenceWorld) {
 
 /// Advances the world by one tick.
 ///
+/// Returns [`EmergenceStatus::FuseTripped`] if the tick hit a hard limit (see
+/// [`emergence_world_set_limits`]). The world is still consistent; undelivered packets stay
+/// queued. The host decides what to do: normally pause and show
+/// [`emergence_world_fuse_report_json`].
+///
 /// # Safety
 ///
 /// `world` must be null or a live handle from [`emergence_world_create`], not in use on
@@ -329,9 +364,9 @@ pub unsafe extern "C" fn emergence_world_destroy(world: *mut EmergenceWorld) {
 pub unsafe extern "C" fn emergence_world_tick(world: *mut EmergenceWorld) -> EmergenceStatus {
     // SAFETY: forwarded from this function's contract.
     unsafe {
-        with_world(world, |world| {
-            world.tick();
-            EmergenceStatus::Ok
+        with_world(world, |world| match world.tick() {
+            TickOutcome::FuseTripped => EmergenceStatus::FuseTripped,
+            TickOutcome::Completed => EmergenceStatus::Ok,
         })
     }
 }
@@ -414,9 +449,13 @@ pub unsafe extern "C" fn emergence_network_create_node(
                 (Ok(name), Ok(kind)) => (name, kind),
                 (Err(status), _) | (_, Err(status)) => return status,
             };
-            let id = world.network_mut().create_node(name, kind);
-            out_node.write(id.into());
-            EmergenceStatus::Ok
+            match world.network_mut().create_node(name, kind) {
+                Ok(id) => {
+                    out_node.write(id.into());
+                    EmergenceStatus::Ok
+                }
+                Err(e) => e.into(),
+            }
         })
     }
 }
@@ -443,9 +482,13 @@ pub unsafe extern "C" fn emergence_network_create_link(
                 Ok(name) => name,
                 Err(status) => return status,
             };
-            let id = world.network_mut().create_link(name);
-            out_link.write(id.into());
-            EmergenceStatus::Ok
+            match world.network_mut().create_link(name) {
+                Ok(id) => {
+                    out_link.write(id.into());
+                    EmergenceStatus::Ok
+                }
+                Err(e) => e.into(),
+            }
         })
     }
 }
@@ -598,17 +641,134 @@ pub unsafe extern "C" fn emergence_network_snapshot_json(
 // Logic and traffic
 // ---------------------------------------------------------------------------------------------
 
-/// Returns the names of the built-in logic kinds as a static JSON array of strings, such as
-/// `["responder","gateway"]`. Do not free it.
+/// Returns the built-in logic kinds as a static JSON array, such as
+/// `[{"name":"responder","faulty":false}, ...]`. Faulty kinds deliberately misbehave, for stress
+/// testing. Do not free the string.
 #[unsafe(no_mangle)]
 pub extern "C" fn emergence_logic_kinds_json() -> *const c_char {
+    #[derive(serde::Serialize)]
+    struct Kind {
+        name: &'static str,
+        faulty: bool,
+    }
     static KINDS: OnceLock<CString> = OnceLock::new();
     KINDS
         .get_or_init(|| {
-            let json = serde_json::to_string(LOGIC_KINDS).unwrap_or_else(|_| "[]".into());
+            let kinds: Vec<Kind> = LOGIC_KINDS
+                .iter()
+                .map(|&name| Kind {
+                    name,
+                    faulty: false,
+                })
+                .chain(
+                    FAULTY_LOGIC_KINDS
+                        .iter()
+                        .map(|&name| Kind { name, faulty: true }),
+                )
+                .collect();
+            let json = serde_json::to_string(&kinds).unwrap_or_else(|_| "[]".into());
             CString::new(json).unwrap_or_default()
         })
         .as_ptr()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Safety limits and health
+// ---------------------------------------------------------------------------------------------
+
+/// Sets the fuse's hard limits. 0 keeps a limit's current value.
+///
+/// # Safety
+///
+/// `world` must be null or a live handle, not in use on another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emergence_world_set_limits(
+    world: *mut EmergenceWorld,
+    max_transmissions_per_tick: u64,
+    max_deliveries_per_tick: u64,
+    max_pending: u64,
+    max_payload_bytes: u64,
+) -> EmergenceStatus {
+    let pick = |new: u64, old: u64| if new == 0 { old } else { new };
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        with_world(world, |world| {
+            let old = world.limits();
+            let as_usize = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
+            world.set_limits(Limits {
+                max_transmissions_per_tick: pick(
+                    max_transmissions_per_tick,
+                    old.max_transmissions_per_tick,
+                ),
+                max_deliveries_per_tick: pick(max_deliveries_per_tick, old.max_deliveries_per_tick),
+                max_pending: as_usize(pick(max_pending, old.max_pending as u64)),
+                max_payload_bytes: as_usize(pick(max_payload_bytes, old.max_payload_bytes as u64)),
+            });
+            EmergenceStatus::Ok
+        })
+    }
+}
+
+/// Turns recording of every packet in the trace on (non-zero, the default) or off (0). Off
+/// makes busy simulations much cheaper; alerts and notes are always recorded.
+///
+/// # Safety
+///
+/// `world` must be null or a live handle, not in use on another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emergence_world_set_trace_packets(
+    world: *mut EmergenceWorld,
+    enabled: u32,
+) -> EmergenceStatus {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        with_world(world, |world| {
+            world.set_trace_packets(enabled != 0);
+            EmergenceStatus::Ok
+        })
+    }
+}
+
+/// Writes the world's load and safety counters as JSON to `out_json`. Free it with
+/// [`emergence_string_free`].
+///
+/// # Safety
+///
+/// `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+/// or valid for a pointer-sized write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emergence_world_health_json(
+    world: *mut EmergenceWorld,
+    out_json: *mut *mut c_char,
+) -> EmergenceStatus {
+    if out_json.is_null() {
+        return EmergenceStatus::NullPointer;
+    }
+    // SAFETY: forwarded from this function's contract.
+    unsafe { with_world(world, |world| write_json(&health::health(world), out_json)) }
+}
+
+/// Writes why the fuse tripped on the last tick as JSON to `out_json` (`null` if it did not).
+/// Free it with [`emergence_string_free`].
+///
+/// # Safety
+///
+/// `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+/// or valid for a pointer-sized write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emergence_world_fuse_report_json(
+    world: *mut EmergenceWorld,
+    out_json: *mut *mut c_char,
+) -> EmergenceStatus {
+    if out_json.is_null() {
+        return EmergenceStatus::NullPointer;
+    }
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        with_world(world, |world| {
+            write_json(&world.fuse_report().map(health::fuse_report), out_json)
+        })
+    }
 }
 
 /// Attaches a built-in logic to `node` by name (see [`emergence_logic_kinds_json`]). An empty
@@ -1050,7 +1210,131 @@ mod tests {
     fn logic_kinds_are_listed() {
         // SAFETY: returns a static NUL-terminated string.
         let json = unsafe { CStr::from_ptr(emergence_logic_kinds_json()) };
-        let kinds: Vec<String> = serde_json::from_slice(json.to_bytes()).unwrap_or_default();
-        assert!(kinds.iter().any(|k| k == "gateway"));
+        let kinds: Vec<serde_json::Value> =
+            serde_json::from_slice(json.to_bytes()).unwrap_or_default();
+        assert!(
+            kinds
+                .iter()
+                .any(|k| k["name"] == "gateway" && k["faulty"] == false)
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|k| k["name"] == "amplifier" && k["faulty"] == true)
+        );
+    }
+
+    fn json_out(
+        world: &TestWorld,
+        f: unsafe extern "C" fn(*mut EmergenceWorld, *mut *mut c_char) -> EmergenceStatus,
+    ) -> serde_json::Value {
+        let mut json = ptr::null_mut();
+        // SAFETY: live world, valid out-pointer; the string is freed below.
+        unsafe {
+            assert_eq!(f(world.0, &raw mut json), EmergenceStatus::Ok);
+            let value = serde_json::from_slice(CStr::from_ptr(json).to_bytes());
+            emergence_string_free(json);
+            value.unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn invalid_and_clashing_names_are_rejected() {
+        let world = TestWorld::new();
+        let mut id = EmergenceNodeId { raw: 0 };
+        // SAFETY: live world and valid strings.
+        unsafe {
+            assert_eq!(
+                emergence_network_create_node(world.0, c"a@b".as_ptr(), c"x".as_ptr(), &raw mut id),
+                EmergenceStatus::InvalidName
+            );
+        }
+        let (root, wifi) = (world.root(), world.link(c"wifi"));
+        let (a, b) = (world.node(c"pc"), world.node(c"pc"));
+        // SAFETY: live world.
+        unsafe {
+            assert_eq!(
+                emergence_network_connect(world.0, root, a, wifi),
+                EmergenceStatus::Ok
+            );
+            assert_eq!(
+                emergence_network_connect(world.0, root, b, wifi),
+                EmergenceStatus::NameConflict
+            );
+        }
+    }
+
+    #[test]
+    fn a_storm_trips_the_fuse_and_explains_why() {
+        let world = TestWorld::new();
+        let (root, a, b) = (world.root(), world.link(c"a"), world.link(c"b"));
+        let sender = world.node(c"sender");
+        // SAFETY: live world and valid strings.
+        unsafe {
+            assert_eq!(
+                emergence_network_connect(world.0, root, sender, a),
+                EmergenceStatus::Ok
+            );
+            for name in [c"b0", c"b1", c"b2", c"b3"] {
+                let bridge = world.node(name);
+                assert_eq!(
+                    emergence_network_connect(world.0, root, bridge, a),
+                    EmergenceStatus::Ok
+                );
+                assert_eq!(
+                    emergence_network_subscribe(world.0, bridge, b),
+                    EmergenceStatus::Ok
+                );
+                assert_eq!(
+                    emergence_world_set_logic(world.0, bridge, c"bridge".as_ptr()),
+                    EmergenceStatus::Ok
+                );
+            }
+            assert_eq!(
+                emergence_world_set_trace_packets(world.0, 0),
+                EmergenceStatus::Ok
+            );
+            assert_eq!(
+                emergence_world_send(
+                    world.0,
+                    sender,
+                    c"a".as_ptr(),
+                    c"*@a".as_ptr(),
+                    c"hi".as_ptr(),
+                    ptr::null(),
+                    0
+                ),
+                EmergenceStatus::Ok
+            );
+            let mut outcome = EmergenceStatus::Ok;
+            for _ in 0..30 {
+                outcome = emergence_world_tick(world.0);
+                if outcome != EmergenceStatus::Ok {
+                    break;
+                }
+            }
+            assert_eq!(outcome, EmergenceStatus::FuseTripped);
+        }
+        let report = json_out(&world, emergence_world_fuse_report_json);
+        assert_eq!(report["limit"], "transmissions");
+        assert!(
+            report["recent_alerts"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| x["check"] == "relay_cycle"))
+        );
+        let health = json_out(&world, emergence_world_health_json);
+        assert_eq!(health["fuse_trips"], 1);
+        assert!(
+            health["peak_transmissions"].as_u64()
+                <= health["limits"]["max_transmissions_per_tick"].as_u64()
+        );
+        let trace = world.drain_trace();
+        let only_alerts = trace["events"]
+            .as_array()
+            .is_some_and(|e| e.iter().all(|x| x["type"] == "alert"));
+        assert!(
+            only_alerts,
+            "packet tracing was off, so only alerts are recorded"
+        );
     }
 }

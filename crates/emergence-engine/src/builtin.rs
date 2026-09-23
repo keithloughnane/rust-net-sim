@@ -1,10 +1,28 @@
 //! Built-in [`ControllerLogic`] implementations, selectable by name.
 
 use crate::route::names;
-use crate::{AcceptRule, Context, ControllerLogic, Event, Packet, PacketRoute, SendError};
+use crate::{
+    AcceptRule, Context, ControllerLogic, Event, Packet, PacketRoute, Relaying, SendError,
+};
 
-/// Names accepted by [`create_logic`].
-pub const LOGIC_KINDS: &[&str] = &[Responder::KIND, Gateway::KIND, Beacon::KIND, Scanner::KIND];
+/// Names of the well-behaved built-in logics, accepted by [`create_logic`].
+pub const LOGIC_KINDS: &[&str] = &[
+    Responder::KIND,
+    Gateway::KIND,
+    Bridge::KIND,
+    Beacon::KIND,
+    Scanner::KIND,
+];
+
+/// Names of deliberately broken logics (see [`faulty`]), also accepted by [`create_logic`].
+/// They reproduce the bugs that have crashed hosts, for stress testing the engine's defences.
+pub const FAULTY_LOGIC_KINDS: &[&str] = &[
+    faulty::Echo::KIND,
+    faulty::Replayer::KIND,
+    faulty::Amplifier::KIND,
+    faulty::Flooder::KIND,
+    faulty::Crasher::KIND,
+];
 
 /// Creates a built-in logic by name, or `None` if the name is unknown.
 #[must_use]
@@ -12,8 +30,14 @@ pub fn create_logic(kind: &str) -> Option<Box<dyn ControllerLogic>> {
     match kind {
         Responder::KIND => Some(Box::new(Responder)),
         Gateway::KIND => Some(Box::new(Gateway)),
+        Bridge::KIND => Some(Box::new(Bridge)),
         Beacon::KIND => Some(Box::new(Beacon::default())),
         Scanner::KIND => Some(Box::new(Scanner::default())),
+        faulty::Echo::KIND => Some(Box::new(faulty::Echo)),
+        faulty::Replayer::KIND => Some(Box::new(faulty::Replayer::default())),
+        faulty::Amplifier::KIND => Some(Box::new(faulty::Amplifier { fan_out: 50 })),
+        faulty::Flooder::KIND => Some(Box::new(faulty::Flooder { per_tick: 1_000 })),
+        faulty::Crasher::KIND => Some(Box::new(faulty::Crasher)),
         _ => None,
     }
 }
@@ -110,6 +134,10 @@ impl Gateway {
 impl ControllerLogic for Gateway {
     fn kind(&self) -> &'static str {
         Self::KIND
+    }
+
+    fn relaying(&self) -> Relaying {
+        Relaying::Routed
     }
 
     fn on_received(&mut self, packet: &Packet, ctx: &mut Context<'_>) {
@@ -228,5 +256,199 @@ impl ControllerLogic for Scanner {
 
     fn on_received(&mut self, packet: &Packet, ctx: &mut Context<'_>) {
         answer_ping(packet, ctx);
+    }
+}
+
+/// Every link this node can transmit on: its subscriptions, then the links it owns.
+fn usable_links(ctx: &Context<'_>) -> Vec<crate::LinkId> {
+    ctx.network()
+        .node(ctx.node())
+        .map(|n| {
+            n.subscriptions()
+                .iter()
+                .chain(n.internal_links())
+                .copied()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A hub or bridge: hears everything on every link it is on and passes it, unchanged, to all of
+/// its other links. Useful and realistic, but two bridges joining the same links make a loop,
+/// and three make a broadcast storm.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Bridge;
+
+impl Bridge {
+    /// Name of this logic.
+    pub const KIND: &'static str = "bridge";
+}
+
+impl ControllerLogic for Bridge {
+    fn kind(&self) -> &'static str {
+        Self::KIND
+    }
+
+    fn wants(&self, _packet: &Packet) -> bool {
+        true
+    }
+
+    fn relaying(&self) -> Relaying {
+        Relaying::Flooding
+    }
+
+    fn on_received(&mut self, packet: &Packet, ctx: &mut Context<'_>) {
+        if ctx.accepted_by() == Some(AcceptRule::Addressed) {
+            answer_ping(packet, ctx);
+            return;
+        }
+        let arrived = ctx.arrived_on();
+        for link in usable_links(ctx) {
+            if Some(link) != arrived {
+                let result = ctx.relay(packet, link);
+                note_err(ctx, "relay", result);
+            }
+        }
+    }
+}
+
+/// Deliberately broken logics that reproduce real failure shapes, for stress tests.
+pub mod faulty {
+    use super::{Context, ControllerLogic, Event, Packet, PacketRoute, names, usable_links};
+    use crate::LinkId;
+
+    /// Answers every packet with a copy of it. Two echoes ping-pong forever, and because every
+    /// reply is a new packet, the TTL never runs out: only the replay check notices.
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct Echo;
+
+    impl Echo {
+        /// Name of this logic.
+        pub const KIND: &'static str = "echo";
+    }
+
+    impl ControllerLogic for Echo {
+        fn kind(&self) -> &'static str {
+            Self::KIND
+        }
+
+        fn on_received(&mut self, packet: &Packet, ctx: &mut Context<'_>) {
+            let _ = ctx.reply(packet, packet.event().clone());
+        }
+    }
+
+    /// A stuck retry: re-sends the first packet it received to its sender, four times every
+    /// tick, forever.
+    #[derive(Debug, Default, Clone)]
+    pub struct Replayer {
+        stuck: Option<(LinkId, PacketRoute, Event)>,
+    }
+
+    impl Replayer {
+        /// Name of this logic.
+        pub const KIND: &'static str = "replayer";
+    }
+
+    impl ControllerLogic for Replayer {
+        fn kind(&self) -> &'static str {
+            Self::KIND
+        }
+
+        fn on_tick(&mut self, ctx: &mut Context<'_>) {
+            if let Some((via, to, event)) = &self.stuck {
+                for _ in 0..4 {
+                    let _ = ctx.send(*via, to.clone(), event.clone());
+                }
+            }
+        }
+
+        fn on_received(&mut self, packet: &Packet, ctx: &mut Context<'_>) {
+            if self.stuck.is_none()
+                && let Some(via) = ctx.arrived_on()
+            {
+                self.stuck = Some((via, packet.from().clone(), packet.event().clone()));
+            }
+        }
+    }
+
+    /// Answers every packet by broadcasting `fan_out` copies of it on the link it came from.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Amplifier {
+        /// Copies sent per packet received.
+        pub fan_out: u32,
+    }
+
+    impl Amplifier {
+        /// Name of this logic.
+        pub const KIND: &'static str = "amplifier";
+    }
+
+    impl ControllerLogic for Amplifier {
+        fn kind(&self) -> &'static str {
+            Self::KIND
+        }
+
+        fn on_received(&mut self, packet: &Packet, ctx: &mut Context<'_>) {
+            let Some(via) = ctx.arrived_on() else { return };
+            let link = ctx.network().link(via).map_or("", |l| l.name()).to_owned();
+            for _ in 0..self.fan_out {
+                let to = PacketRoute::new(names::BROADCAST, link.clone());
+                if ctx.send(via, to, packet.event().clone()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Sends `per_tick` broadcasts on each of its links every tick.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Flooder {
+        /// Packets per link per tick.
+        pub per_tick: u32,
+    }
+
+    impl Flooder {
+        /// Name of this logic.
+        pub const KIND: &'static str = "flooder";
+    }
+
+    impl ControllerLogic for Flooder {
+        fn kind(&self) -> &'static str {
+            Self::KIND
+        }
+
+        fn on_tick(&mut self, ctx: &mut Context<'_>) {
+            for link in usable_links(ctx) {
+                let name = ctx.network().link(link).map_or("", |l| l.name()).to_owned();
+                for i in 0..self.per_tick {
+                    let event = Event::with_data("flood", format!("{}-{i}", ctx.tick()));
+                    let to = PacketRoute::new(names::BROADCAST, name.clone());
+                    if ctx.send(link, to, event).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        fn on_received(&mut self, _packet: &Packet, _ctx: &mut Context<'_>) {}
+    }
+
+    /// Panics whenever it receives a packet, like a bug in player-made logic.
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct Crasher;
+
+    impl Crasher {
+        /// Name of this logic.
+        pub const KIND: &'static str = "crasher";
+    }
+
+    impl ControllerLogic for Crasher {
+        fn kind(&self) -> &'static str {
+            Self::KIND
+        }
+
+        fn on_received(&mut self, _packet: &Packet, _ctx: &mut Context<'_>) {
+            panic!("crasher logic received a packet");
+        }
     }
 }

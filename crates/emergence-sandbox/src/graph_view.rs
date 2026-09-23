@@ -24,6 +24,15 @@ pub(crate) enum Item {
     Link(LinkId),
 }
 
+/// What is drawn on top of the network: traffic and alert badges.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Overlay<'a> {
+    pub(crate) activity: &'a Activity,
+    pub(crate) marks: &'a HashMap<crate::health::Subject, crate::health::Severity>,
+    /// UI time in seconds, for animation.
+    pub(crate) now: f64,
+}
+
 /// What the user asked for this frame.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ViewAction {
@@ -304,9 +313,13 @@ impl GraphView {
         snap: &Snapshot,
         scope: NodeId,
         selection: Option<Item>,
-        activity: &Activity,
-        now: f64,
+        overlay: Overlay<'_>,
     ) -> Option<ViewAction> {
+        let Overlay {
+            activity,
+            marks,
+            now,
+        } = overlay;
         let scene = Scene::new(snap, scope);
         let view = self.scopes.entry(scope).or_insert_with(ScopeView::new);
         view.sync(&scene);
@@ -468,6 +481,7 @@ impl GraphView {
         }
 
         draw_flights(&painter, activity, now, &rects, &place, zoom);
+        draw_marks(&painter, marks, &rects, &place, zoom);
         if !activity.flights.is_empty() {
             ui.ctx().request_repaint();
         }
@@ -588,6 +602,40 @@ fn draw_flights(
                 draw(from, place(r).map(|r| r.center()));
             }
         }
+    }
+}
+
+/// Alert badges: a coloured "!" on each node or link with a recent alert. Nodes deeper inside
+/// the current level mark the child that contains them.
+fn draw_marks(
+    painter: &egui::Painter,
+    marks: &HashMap<crate::health::Subject, crate::health::Severity>,
+    rects: &HashMap<Item, Rect>,
+    place: &dyn Fn(NodeId) -> Option<Rect>,
+    zoom: f32,
+) {
+    let mut badges: HashMap<Rect2, crate::health::Severity> = HashMap::new();
+    for (&subject, &severity) in marks {
+        let rect = match subject {
+            crate::health::Subject::Node(n) => place(n),
+            crate::health::Subject::Link(l) => rects.get(&Item::Link(l)).copied(),
+        };
+        if let Some(r) = rect {
+            let e = badges.entry(Rect2(r)).or_insert(severity);
+            *e = (*e).max(severity);
+        }
+    }
+    let radius = (8.0 * zoom).clamp(5.0, 12.0);
+    for (Rect2(r), severity) in badges {
+        let center = r.left_top() + vec2(0.0, 0.0);
+        painter.circle_filled(center, radius, style::severity_color(severity));
+        painter.text(
+            center,
+            Align2::CENTER_CENTER,
+            "!",
+            FontId::proportional(radius * 1.5),
+            Color32::BLACK,
+        );
     }
 }
 

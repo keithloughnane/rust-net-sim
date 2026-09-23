@@ -55,3 +55,15 @@ pub(crate) fn event_color(kind: &str) -> Color32 {
         other => pick(other, 0x517C_C1B7),
     }
 }
+
+pub(crate) const WARN: Color32 = Color32::from_rgb(255, 202, 40);
+
+/// Colour for an alert severity.
+pub(crate) fn severity_color(severity: crate::health::Severity) -> Color32 {
+    match severity {
+        crate::health::Severity::Warning => WARN,
+        crate::health::Severity::Error => DROP,
+    }
+}
+
+pub(crate) const PASS: Color32 = Color32::from_rgb(102, 187, 106);

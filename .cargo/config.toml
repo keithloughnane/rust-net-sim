@@ -3,5 +3,7 @@
 xtask = "run -q -p xtask --"
 # `cargo sandbox` builds the native library and runs the test UI against it.
 sandbox = "run -q -p xtask -- sandbox"
+# `cargo ctl <command>` drives the running sandbox window from the terminal (`cargo ctl help`).
+ctl = "run -q -p emergence-sandbox --bin emergence-ctl --"
 # `cargo check-all` runs clippy on every crate and target, with warnings as errors.
 check-all = "clippy --workspace --all-targets -- -D warnings"

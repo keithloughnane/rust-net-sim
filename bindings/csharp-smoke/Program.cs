@@ -49,6 +49,37 @@ internal static class Program
             Expect(world.SnapshotJson().Contains("\"logic\":\"gateway\""), "snapshot shows logic");
             Expect(EmergenceLibrary.LogicKindsJson.Contains("responder"), "logic kinds listed");
 
+            // A broadcast storm: bridges joining two links in a loop. The fuse must trip, and the
+            // report must say why, instead of the host running out of memory.
+            var linkA = world.CreateLink("storm-a");
+            var linkB = world.CreateLink("storm-b");
+            var shouter = world.CreateNode("shouter", "device");
+            world.Connect(root, shouter, linkA);
+            for (var i = 0; i < 4; i++)
+            {
+                var bridge = world.CreateNode($"bridge-{i}", "hub");
+                world.Connect(root, bridge, linkA);
+                world.Subscribe(bridge, linkB);
+                world.SetLogic(bridge, "bridge");
+            }
+            world.SetTracePackets(false);
+            world.Send(shouter, "storm-a", "*@storm-a", "hello");
+            var tripped = false;
+            for (var i = 0; i < 30 && !tripped; i++) tripped = world.Tick() == TickOutcome.FuseTripped;
+            Expect(tripped, "the storm tripped the fuse");
+            Expect(world.FuseReportJson().Contains("relay_cycle"), "the fuse report names the relay loop");
+            Expect(world.HealthJson().Contains("\"fuse_trips\":1"), "health counts the trip");
+
+            try
+            {
+                world.CreateNode("bad@name", "x");
+                Expect(false, "invalid names throw");
+            }
+            catch (EmergenceException e)
+            {
+                Expect(e.Status == "InvalidName", $"invalid name status (got {e.Status})");
+            }
+
             try
             {
                 world.SetLogic(pc, "teleporter");

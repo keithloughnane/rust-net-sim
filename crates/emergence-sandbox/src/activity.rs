@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 
 use eframe::egui::Color32;
 
+use crate::health::{Alert, Severity};
 use crate::native::{LinkId, NodeId};
 use crate::snapshot::Snapshot;
 use crate::style;
@@ -13,6 +14,12 @@ use crate::trace::TraceEntry;
 /// How long a node keeps glowing after a packet arrives, in seconds.
 pub(crate) const GLOW_SECONDS: f64 = 0.8;
 const LOG_CAPACITY: usize = 2_000;
+const ALERT_CAPACITY: usize = 1_000;
+/// Most packets animated per batch. A storm can produce tens of thousands per tick; drawing
+/// them all would freeze the UI the sandbox is supposed to keep responsive.
+const MAX_FLIGHTS_PER_BATCH: usize = 300;
+/// Most per-packet log lines per batch; the rest are summarised in one line.
+const MAX_LOG_LINES_PER_BATCH: usize = 60;
 
 /// One transmission: a sender puts a packet on a link and some listeners accept it.
 #[derive(Debug, Clone)]
@@ -48,6 +55,7 @@ pub(crate) struct LogLine {
 pub(crate) struct Activity {
     pub(crate) flights: Vec<Flight>,
     pub(crate) log: VecDeque<LogLine>,
+    pub(crate) alerts: VecDeque<Alert>,
     pub(crate) packets: u64,
     pub(crate) drops: u64,
 }
@@ -127,16 +135,54 @@ impl Activity {
                     color: style::TEXT_WEAK,
                     nodes: vec![node],
                 }),
+                TraceEntry::Alert(alert) => self.ingest_alert(snap, alert),
                 TraceEntry::Other => {}
             }
         }
 
-        for (flight, info) in batch {
+        let total = batch.len();
+        let tick = batch.last().map_or(0, |(_, info)| info.tick);
+        for (i, (flight, info)) in batch.into_iter().enumerate() {
             self.packets += 1;
-            let line = describe(snap, &flight, &info);
-            self.push_log(line);
-            self.flights.push(flight);
+            if i < MAX_LOG_LINES_PER_BATCH {
+                let line = describe(snap, &flight, &info);
+                self.push_log(line);
+            }
+            if i < MAX_FLIGHTS_PER_BATCH {
+                self.flights.push(flight);
+            }
         }
+        if total > MAX_LOG_LINES_PER_BATCH {
+            self.push_log(LogLine {
+                tick,
+                text: format!(
+                    "… and {} more packets (only the first {MAX_FLIGHTS_PER_BATCH} are animated)",
+                    total - MAX_LOG_LINES_PER_BATCH
+                ),
+                color: style::TEXT_WEAK,
+                nodes: Vec::new(),
+            });
+        }
+    }
+
+    fn ingest_alert(&mut self, snap: &Snapshot, alert: Alert) {
+        let (nodes, about) = match alert.subject {
+            Some(crate::health::Subject::Node(n)) => (vec![n], snap.node_name(n).to_owned()),
+            Some(crate::health::Subject::Link(l)) => {
+                (Vec::new(), format!("link {}", snap.link_name(l)))
+            }
+            None => (Vec::new(), "network".to_owned()),
+        };
+        self.push_log(LogLine {
+            tick: alert.tick,
+            text: format!("⚠ {} · {about}: {}", alert.check, alert.message),
+            color: style::severity_color(alert.severity),
+            nodes,
+        });
+        if self.alerts.len() == ALERT_CAPACITY {
+            self.alerts.pop_front();
+        }
+        self.alerts.push_back(alert);
     }
 
     /// Forgets animations that have finished glowing.
@@ -201,5 +247,19 @@ fn describe(snap: &Snapshot, flight: &Flight, info: &SentInfo) -> LogLine {
             style::event_color(&flight.kind)
         },
         nodes,
+    }
+}
+
+impl Activity {
+    /// The most severe recent alert about each node or link, for badges on the canvas.
+    pub(crate) fn marks(&self, since_tick: u64) -> HashMap<crate::health::Subject, Severity> {
+        let mut marks = HashMap::new();
+        for a in self.alerts.iter().filter(|a| a.tick >= since_tick) {
+            if let Some(subject) = a.subject {
+                let e = marks.entry(subject).or_insert(a.severity);
+                *e = (*e).max(a.severity);
+            }
+        }
+        marks
     }
 }

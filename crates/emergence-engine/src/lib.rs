@@ -25,6 +25,7 @@
 mod builtin;
 mod ids;
 mod logic;
+mod monitor;
 mod network;
 mod packet;
 mod route;
@@ -32,15 +33,17 @@ mod trace;
 mod world;
 
 pub use builtin::{
-    Beacon, Gateway, LOGIC_KINDS, Responder, Scanner, create_logic, events as builtin_events,
+    Beacon, Bridge, FAULTY_LOGIC_KINDS, Gateway, LOGIC_KINDS, Responder, Scanner, create_logic,
+    events as builtin_events, faulty,
 };
 pub use ids::{LinkId, NodeId};
-pub use logic::{AcceptRule, Context, ControllerLogic, SendError};
+pub use logic::{AcceptRule, Context, ControllerLogic, Relaying, SendError};
+pub use monitor::{Alert, Check, MonitorConfig, Severity, Subject, Threshold};
 pub use network::{ControlNode, Link, Network, NetworkError};
 pub use packet::{Event, Packet, PacketId};
 pub use route::{Hop, PacketRoute, RouteError, names};
 pub use trace::{DropReason, TraceEvent};
-pub use world::{LogicError, NodeStats, World};
+pub use world::{FuseLimit, FuseReport, Health, Limits, LogicError, NodeStats, TickOutcome, World};
 
 /// The version of this crate, as set in `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

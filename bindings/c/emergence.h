@@ -10,7 +10,7 @@
 #include <stdlib.h>
 
 // Version of the C ABI. Bump whenever an exported signature or type layout changes.
-#define EMERGENCE_ABI_VERSION 3
+#define EMERGENCE_ABI_VERSION 4
 
 // Result of a fallible call. Always 32 bits wide, whatever the host compiler does with enums.
 enum EmergenceStatus
@@ -46,6 +46,18 @@ enum EmergenceStatus
   EMERGENCE_STATUS_INVALID_ROUTE = 12,
   // The node is neither subscribed to the link nor its owner, so it cannot send on it.
   EMERGENCE_STATUS_NOT_ON_LINK = 13,
+  // A node or link name is empty, too long, reserved, or contains route syntax (`@`, `/`).
+  EMERGENCE_STATUS_INVALID_NAME = 14,
+  // Another node on the same link already has that name, or the node already uses another
+  // link with that name.
+  EMERGENCE_STATUS_NAME_CONFLICT = 15,
+  // The send queue is full; the world is overloaded. Nothing was sent.
+  EMERGENCE_STATUS_QUEUE_FULL = 16,
+  // The event payload or kind is larger than the limits allow.
+  EMERGENCE_STATUS_PAYLOAD_TOO_LARGE = 17,
+  // Not an error: the tick ran, but hit a hard limit and held packets back. The network is
+  // running away. Pause and read [`emergence_world_fuse_report_json`].
+  EMERGENCE_STATUS_FUSE_TRIPPED = 18,
   // The operation failed for a reason this ABI version does not have a code for.
   EMERGENCE_STATUS_FAILED = 255,
 };
@@ -114,6 +126,11 @@ EmergenceStatus emergence_world_create(struct EmergenceWorld **out_world);
 void emergence_world_destroy(struct EmergenceWorld *world);
 
 // Advances the world by one tick.
+//
+// Returns [`EmergenceStatus::FuseTripped`] if the tick hit a hard limit (see
+// [`emergence_world_set_limits`]). The world is still consistent; undelivered packets stay
+// queued. The host decides what to do: normally pause and show
+// [`emergence_world_fuse_report_json`].
 //
 // # Safety
 //
@@ -226,9 +243,47 @@ EmergenceStatus emergence_network_disconnect(struct EmergenceWorld *world,
 // or valid for a pointer-sized write.
 EmergenceStatus emergence_network_snapshot_json(struct EmergenceWorld *world, char **out_json);
 
-// Returns the names of the built-in logic kinds as a static JSON array of strings, such as
-// `["responder","gateway"]`. Do not free it.
+// Returns the built-in logic kinds as a static JSON array, such as
+// `[{"name":"responder","faulty":false}, ...]`. Faulty kinds deliberately misbehave, for stress
+// testing. Do not free the string.
 const char *emergence_logic_kinds_json(void);
+
+// Sets the fuse's hard limits. 0 keeps a limit's current value.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread.
+EmergenceStatus emergence_world_set_limits(struct EmergenceWorld *world,
+                                           uint64_t max_transmissions_per_tick,
+                                           uint64_t max_deliveries_per_tick,
+                                           uint64_t max_pending,
+                                           uint64_t max_payload_bytes);
+
+// Turns recording of every packet in the trace on (non-zero, the default) or off (0). Off
+// makes busy simulations much cheaper; alerts and notes are always recorded.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread.
+EmergenceStatus emergence_world_set_trace_packets(struct EmergenceWorld *world, uint32_t enabled);
+
+// Writes the world's load and safety counters as JSON to `out_json`. Free it with
+// [`emergence_string_free`].
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+// or valid for a pointer-sized write.
+EmergenceStatus emergence_world_health_json(struct EmergenceWorld *world, char **out_json);
+
+// Writes why the fuse tripped on the last tick as JSON to `out_json` (`null` if it did not).
+// Free it with [`emergence_string_free`].
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+// or valid for a pointer-sized write.
+EmergenceStatus emergence_world_fuse_report_json(struct EmergenceWorld *world, char **out_json);
 
 // Attaches a built-in logic to `node` by name (see [`emergence_logic_kinds_json`]). An empty
 // string or `"none"` removes the node's logic.

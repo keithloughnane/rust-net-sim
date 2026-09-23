@@ -6,7 +6,7 @@ use serde::Deserialize;
 use crate::native::{LinkId, NodeId};
 
 /// Trace format version this module understands.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -35,6 +35,7 @@ pub(crate) enum TraceEntry {
         node: NodeId,
         text: String,
     },
+    Alert(crate::health::Alert),
     /// Anything newer than this sandbox understands.
     #[serde(other)]
     Other,
@@ -63,15 +64,18 @@ mod tests {
 
     #[test]
     fn parses_every_entry_type_and_tolerates_new_ones() -> Result<(), serde_json::Error> {
-        let json = br#"{"format":1,"discarded":0,"events":[
+        let json = br#"{"format":2,"discarded":0,"events":[
             {"type":"sent","tick":1,"packet":7,"sender":2,"link":3,"from":"a@w","to":"*@w","kind":"ping","data":"t1","data_len":2,"ttl":16},
             {"type":"delivered","tick":1,"packet":7,"receiver":4,"link":3,"rule":"broadcast"},
             {"type":"dropped","tick":1,"packet":7,"at":null,"reason":"no_recipient"},
             {"type":"note","tick":1,"node":2,"text":"hi"},
+            {"type":"alert","tick":1,"check":"replay","severity":"warning","subject":{"node":2},"value":8,"limit":8,"message":"m"},
+            {"type":"alert","tick":1,"check":"network_rate","severity":"error","subject":null,"value":1,"limit":1,"message":"m"},
             {"type":"teleported","tick":1}]}"#;
         let events = parse(json)?;
-        assert_eq!(events.len(), 5);
-        assert!(matches!(events[4], TraceEntry::Other));
+        assert_eq!(events.len(), 7);
+        assert!(matches!(events[4], TraceEntry::Alert(_)));
+        assert!(matches!(events[6], TraceEntry::Other));
         Ok(())
     }
 }

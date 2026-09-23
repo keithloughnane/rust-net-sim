@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::{AcceptRule, LinkId, NodeId, Packet, PacketId};
+use crate::{AcceptRule, Alert, LinkId, NodeId, Packet, PacketId};
 
 /// Why a packet copy went nowhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -10,6 +10,8 @@ pub enum DropReason {
     TtlExpired,
     /// Nobody on the link accepted it.
     NoRecipient,
+    /// The sender left the link after queueing it, so it was never transmitted.
+    SenderLeftLink,
 }
 
 /// Something that happened during a tick, for debugging tools and visualisers.
@@ -51,6 +53,8 @@ pub enum TraceEvent {
         /// Why.
         reason: DropReason,
     },
+    /// A monitor check noticed something. Always recorded, even when packet tracing is off.
+    Alert(Alert),
     /// A note written by a node's logic.
     Note {
         /// Tick it happened on.
@@ -86,5 +90,9 @@ impl TraceLog {
 
     pub(crate) fn discarded(&self) -> u64 {
         self.discarded
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.events.len()
     }
 }

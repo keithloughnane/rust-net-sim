@@ -91,7 +91,7 @@ impl Link {
 }
 
 /// Why a [`Network`] operation was rejected. A rejected operation changes nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NetworkError {
     /// The node handle does not refer to a node in this network.
@@ -108,6 +108,24 @@ pub enum NetworkError {
     LinkOwnedElsewhere(LinkId),
     /// The node is not a child of the given parent.
     NotAChild(NodeId),
+    /// The name is empty, too long, a reserved token, or contains route syntax.
+    /// See [`Network::validate_name`].
+    InvalidName(String),
+    /// Another node on the same link already has this node's name, so addresses on that link
+    /// would be ambiguous.
+    NameConflict {
+        /// The node being attached.
+        node: NodeId,
+        /// The node already using the name.
+        with: NodeId,
+    },
+    /// The node already owns, or already subscribes to, another link with this name.
+    LinkNameConflict {
+        /// The link being attached.
+        link: LinkId,
+        /// The link already using the name.
+        with: LinkId,
+    },
 }
 
 impl fmt::Display for NetworkError {
@@ -122,6 +140,16 @@ impl fmt::Display for NetworkError {
                 write!(f, "link {id:?} is already internal to another node")
             }
             Self::NotAChild(id) => write!(f, "node {id:?} is not a child of that parent"),
+            Self::InvalidName(reason) => write!(f, "invalid name: {reason}"),
+            Self::NameConflict { node, with } => {
+                write!(
+                    f,
+                    "node {node:?} has the same name as {with:?} on a shared link"
+                )
+            }
+            Self::LinkNameConflict { link, with } => {
+                write!(f, "link {link:?} has the same name as {with:?}")
+            }
         }
     }
 }
@@ -137,8 +165,8 @@ impl std::error::Error for NetworkError {}
 /// use emergence_engine::Network;
 ///
 /// let mut net = Network::new();
-/// let wifi = net.create_link("wifi-1");
-/// let laptop = net.create_node("laptop", "computer");
+/// let wifi = net.create_link("wifi-1")?;
+/// let laptop = net.create_node("laptop", "computer")?;
 /// net.connect(net.root(), laptop, Some(wifi))?;
 ///
 /// assert_eq!(net.node(laptop).unwrap().parent(), Some(net.root()));
@@ -204,33 +232,150 @@ impl Network {
         self.links.iter()
     }
 
+    /// Longest allowed node or link name, in characters.
+    pub const MAX_NAME_LEN: usize = 64;
+
+    /// Checks a node or link name. Names are addresses, so they must be non-empty, at most
+    /// [`MAX_NAME_LEN`](Self::MAX_NAME_LEN) characters, not one of the reserved
+    /// [`names`](crate::names), free of route syntax (`@`, `/`) and control characters, and
+    /// without leading or trailing whitespace.
+    ///
+    /// # Errors
+    ///
+    /// Describes the first problem found.
+    pub fn validate_name(name: &str) -> Result<(), NetworkError> {
+        use crate::names;
+        let problem = if name.is_empty() {
+            Some("a name cannot be empty".to_owned())
+        } else if name.chars().count() > Self::MAX_NAME_LEN {
+            Some(format!(
+                "`{name}` is longer than {} characters",
+                Self::MAX_NAME_LEN
+            ))
+        } else if [
+            names::ROOT,
+            names::PARENT,
+            names::BROADCAST,
+            names::ANY_LINK,
+        ]
+        .contains(&name)
+        {
+            Some(format!("`{name}` is reserved"))
+        } else if name.contains(['@', '/']) {
+            Some(format!(
+                "`{name}` contains `@` or `/`, which are route syntax"
+            ))
+        } else if name.chars().any(char::is_control) {
+            Some("a name cannot contain control characters".to_owned())
+        } else if name.trim() != name {
+            Some(format!("`{name}` has leading or trailing whitespace"))
+        } else {
+            None
+        };
+        problem.map_or(Ok(()), |p| Err(NetworkError::InvalidName(p)))
+    }
+
     /// Creates a detached node. Attach it with [`connect`](Self::connect).
-    #[must_use = "a node that is never connected is unreachable"]
-    pub fn create_node(&mut self, name: impl Into<String>, kind: impl Into<String>) -> NodeId {
-        self.nodes.insert(ControlNode::new(name, kind))
+    ///
+    /// # Errors
+    ///
+    /// Fails if the name is invalid (see [`validate_name`](Self::validate_name)).
+    pub fn create_node(
+        &mut self,
+        name: impl Into<String>,
+        kind: impl Into<String>,
+    ) -> Result<NodeId, NetworkError> {
+        let name = name.into();
+        Self::validate_name(&name)?;
+        Ok(self.nodes.insert(ControlNode::new(name, kind)))
     }
 
     /// Creates a link with no owner and no subscribers.
-    #[must_use = "a link that is never attached is unreachable"]
-    pub fn create_link(&mut self, name: impl Into<String>) -> LinkId {
-        self.links.insert(Link {
-            name: name.into(),
+    ///
+    /// # Errors
+    ///
+    /// Fails if the name is invalid (see [`validate_name`](Self::validate_name)).
+    pub fn create_link(&mut self, name: impl Into<String>) -> Result<LinkId, NetworkError> {
+        let name = name.into();
+        Self::validate_name(&name)?;
+        Ok(self.links.insert(Link {
+            name,
             owner: None,
             subscribers: Vec::new(),
-        })
+        }))
+    }
+
+    /// Everyone who hears `link`: its subscribers and its owner.
+    fn audience(&self, link: LinkId) -> impl Iterator<Item = NodeId> + '_ {
+        self.links
+            .get(link)
+            .into_iter()
+            .flat_map(|l| l.subscribers.iter().copied().chain(l.owner))
+    }
+
+    /// Fails if `node` joining `link`'s audience would give it a name another listener has.
+    fn check_node_name_on(&self, node: NodeId, link: LinkId) -> Result<(), NetworkError> {
+        let name = &self.nodes[node].name;
+        match self
+            .audience(link)
+            .find(|&n| n != node && self.nodes.get(n).is_some_and(|o| &o.name == name))
+        {
+            Some(with) => Err(NetworkError::NameConflict { node, with }),
+            None => Ok(()),
+        }
+    }
+
+    /// Fails if `link` has the same name as one of `others`.
+    fn check_link_name_among(&self, link: LinkId, others: &[LinkId]) -> Result<(), NetworkError> {
+        let name = &self.links[link].name;
+        match others
+            .iter()
+            .copied()
+            .find(|&o| o != link && self.links.get(o).is_some_and(|l| &l.name == name))
+        {
+            Some(with) => Err(NetworkError::LinkNameConflict { link, with }),
+            None => Ok(()),
+        }
+    }
+
+    /// The checks [`add_internal_link`](Self::add_internal_link) makes, without changing
+    /// anything. `Ok(false)` means the link is already internal to `owner`.
+    fn check_add_internal_link(&self, owner: NodeId, link: LinkId) -> Result<bool, NetworkError> {
+        let owner_node = self.check_node(owner)?;
+        match self.check_link(link)?.owner {
+            Some(current) if current == owner => return Ok(false),
+            Some(_) => return Err(NetworkError::LinkOwnedElsewhere(link)),
+            None => {}
+        }
+        self.check_link_name_among(link, &owner_node.internal_links)?;
+        if owner != self.root {
+            self.check_node_name_on(owner, link)?;
+        }
+        Ok(true)
+    }
+
+    /// The checks [`subscribe`](Self::subscribe) makes, without changing anything. `Ok(false)`
+    /// means the node is already subscribed.
+    fn check_subscribe(&self, node: NodeId, link: LinkId) -> Result<bool, NetworkError> {
+        let n = self.check_node(node)?;
+        if self.check_link(link)?.subscribers.contains(&node) {
+            return Ok(false);
+        }
+        self.check_link_name_among(link, &n.subscriptions)?;
+        self.check_node_name_on(node, link)?;
+        Ok(true)
     }
 
     /// Makes `link` internal to `owner`. Does nothing if it already is.
     ///
     /// # Errors
     ///
-    /// Fails if either handle is unknown or the link is already internal to another node.
+    /// Fails if either handle is unknown, the link is already internal to another node, the
+    /// owner already has an internal link with this name, or a subscriber of the link has the
+    /// owner's name.
     pub fn add_internal_link(&mut self, owner: NodeId, link: LinkId) -> Result<(), NetworkError> {
-        self.check_node(owner)?;
-        match self.check_link(link)?.owner {
-            Some(current) if current == owner => return Ok(()),
-            Some(_) => return Err(NetworkError::LinkOwnedElsewhere(link)),
-            None => {}
+        if !self.check_add_internal_link(owner, link)? {
+            return Ok(());
         }
         self.links[link].owner = Some(owner);
         self.nodes[owner].internal_links.push(link);
@@ -266,10 +411,14 @@ impl Network {
         if self.ancestors_and_self(parent).any(|a| a == node) {
             return Err(NetworkError::WouldCreateCycle);
         }
-        if let Some(link) = link
-            && self.check_link(link)?.owner.is_some_and(|o| o != parent)
-        {
-            return Err(NetworkError::LinkOwnedElsewhere(link));
+        if let Some(link) = link {
+            self.check_add_internal_link(parent, link)?;
+            self.check_subscribe(node, link)?;
+            // The owner is about to join the audience too.
+            let owner_joins = self.links[link].owner.is_none() && parent != self.root;
+            if owner_joins && self.nodes[parent].name == self.nodes[node].name {
+                return Err(NetworkError::NameConflict { node, with: parent });
+            }
         }
 
         // Everything is validated; nothing below can fail.
@@ -288,10 +437,10 @@ impl Network {
     ///
     /// # Errors
     ///
-    /// Fails if either handle is unknown.
+    /// Fails if either handle is unknown, another node on the link has this node's name, or
+    /// the node already subscribes to a different link with this link's name.
     pub fn subscribe(&mut self, node: NodeId, link: LinkId) -> Result<(), NetworkError> {
-        self.check_node(node)?;
-        if self.check_link(link)?.subscribers.contains(&node) {
+        if !self.check_subscribe(node, link)? {
             return Ok(());
         }
         self.links[link].subscribers.push(node);
@@ -398,9 +547,9 @@ mod tests {
     #[test]
     fn connect_with_link_builds_hierarchy_and_subscription() -> TestResult {
         let mut net = Network::new();
-        let pc = net.create_node("pc", "computer");
-        let app = net.create_node("app", "app");
-        let ipc = net.create_link("ipc");
+        let pc = net.create_node("pc", "computer")?;
+        let app = net.create_node("app", "app")?;
+        let ipc = net.create_link("ipc")?;
         net.connect(net.root(), pc, None)?;
         net.connect(pc, app, Some(ipc))?;
 
@@ -417,9 +566,9 @@ mod tests {
     #[test]
     fn connecting_twice_to_same_parent_adds_second_link_only() -> TestResult {
         let mut net = Network::new();
-        let pc = net.create_node("pc", "computer");
-        let a = net.create_link("a");
-        let b = net.create_link("b");
+        let pc = net.create_node("pc", "computer")?;
+        let a = net.create_link("a")?;
+        let b = net.create_link("b")?;
         net.connect(net.root(), pc, Some(a))?;
         net.connect(net.root(), pc, Some(b))?;
         assert_eq!(net.nodes[net.root()].children(), &[pc]);
@@ -431,9 +580,9 @@ mod tests {
     fn a_node_cannot_have_two_parents() -> TestResult {
         let mut net = Network::new();
         let (p1, p2, child) = (
-            net.create_node("p1", "x"),
-            net.create_node("p2", "x"),
-            net.create_node("c", "x"),
+            net.create_node("p1", "x")?,
+            net.create_node("p2", "x")?,
+            net.create_node("c", "x")?,
         );
         net.connect(p1, child, None)?;
         assert_eq!(
@@ -446,8 +595,8 @@ mod tests {
     #[test]
     fn cycles_and_root_reparenting_are_rejected() -> TestResult {
         let mut net = Network::new();
-        let a = net.create_node("a", "x");
-        let b = net.create_node("b", "x");
+        let a = net.create_node("a", "x")?;
+        let b = net.create_node("b", "x")?;
         net.connect(a, b, None)?;
         assert_eq!(net.connect(b, a, None), Err(NetworkError::WouldCreateCycle));
         assert_eq!(net.connect(a, a, None), Err(NetworkError::WouldCreateCycle));
@@ -459,11 +608,11 @@ mod tests {
     fn rejected_connect_changes_nothing() -> TestResult {
         let mut net = Network::new();
         let (p1, p2, child) = (
-            net.create_node("p1", "x"),
-            net.create_node("p2", "x"),
-            net.create_node("c", "x"),
+            net.create_node("p1", "x")?,
+            net.create_node("p2", "x")?,
+            net.create_node("c", "x")?,
         );
-        let link = net.create_link("l");
+        let link = net.create_link("l")?;
         net.add_internal_link(p1, link)?;
 
         assert_eq!(
@@ -479,9 +628,9 @@ mod tests {
     #[test]
     fn subscribe_to_outside_link_leaves_hierarchy_alone() -> TestResult {
         let mut net = Network::new();
-        let wifi = net.create_link("wifi");
-        let house = net.create_node("house", "building");
-        let laptop = net.create_node("laptop", "computer");
+        let wifi = net.create_link("wifi")?;
+        let house = net.create_node("house", "building")?;
+        let laptop = net.create_node("laptop", "computer")?;
         net.add_internal_link(net.root(), wifi)?;
         net.connect(house, laptop, None)?;
         net.subscribe(laptop, wifi)?;
@@ -494,10 +643,10 @@ mod tests {
     #[test]
     fn disconnect_leaves_parent_links_but_keeps_everything_else() -> TestResult {
         let mut net = Network::new();
-        let pc = net.create_node("pc", "computer");
-        let app = net.create_node("app", "app");
-        let ipc = net.create_link("ipc");
-        let wifi = net.create_link("wifi");
+        let pc = net.create_node("pc", "computer")?;
+        let app = net.create_node("app", "app")?;
+        let ipc = net.create_link("ipc")?;
+        let wifi = net.create_link("wifi")?;
         net.connect(pc, app, Some(ipc))?;
         net.subscribe(app, wifi)?;
 
@@ -521,11 +670,108 @@ mod tests {
     }
 
     #[test]
-    fn raw_handles_round_trip_and_are_never_zero() {
+    fn raw_handles_round_trip_and_are_never_zero() -> TestResult {
         let mut net = Network::new();
-        let node = net.create_node("n", "x");
+        let node = net.create_node("n", "x")?;
         assert_ne!(node.to_raw(), 0);
         assert_eq!(NodeId::from_raw(node.to_raw()), node);
         assert!(net.node(NodeId::from_raw(0)).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_names_are_rejected() {
+        let mut net = Network::new();
+        for bad in [
+            "",
+            "*",
+            "^",
+            "?",
+            ".",
+            "a@b",
+            "a/b",
+            " pad",
+            "tab\t",
+            &"x".repeat(65),
+        ] {
+            assert!(
+                matches!(net.create_node(bad, "x"), Err(NetworkError::InvalidName(_))),
+                "node name {bad:?} was accepted"
+            );
+            assert!(
+                matches!(net.create_link(bad), Err(NetworkError::InvalidName(_))),
+                "link name {bad:?} was accepted"
+            );
+        }
+        assert!(net.create_node("⊙PAN device", "x").is_ok());
+    }
+
+    #[test]
+    fn same_name_is_fine_in_separate_computers_but_not_on_one_link() -> TestResult {
+        let mut net = Network::new();
+        let root = net.root();
+        let wifi = net.create_link("wifi")?;
+        let (pc1, pc2) = (
+            net.create_node("pc-1", "computer")?,
+            net.create_node("pc-2", "computer")?,
+        );
+        net.connect(root, pc1, Some(wifi))?;
+        net.connect(root, pc2, Some(wifi))?;
+        for pc in [pc1, pc2] {
+            let ipc = net.create_link("ipc")?;
+            let registry = net.create_node("registry", "service")?;
+            net.connect(pc, registry, Some(ipc))?;
+        }
+
+        let dup = net.create_node("pc-1", "computer")?;
+        assert_eq!(
+            net.connect(root, dup, Some(wifi)),
+            Err(NetworkError::NameConflict {
+                node: dup,
+                with: pc1
+            })
+        );
+        assert_eq!(
+            net.node(dup).and_then(ControlNode::parent),
+            None,
+            "rejected connect changed nothing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_owner_cannot_share_a_name_with_its_link_subscribers() -> TestResult {
+        let mut net = Network::new();
+        let pc = net.create_node("pc", "computer")?;
+        let app = net.create_node("pc", "app")?;
+        let ipc = net.create_link("ipc")?;
+        assert_eq!(
+            net.connect(pc, app, Some(ipc)),
+            Err(NetworkError::NameConflict {
+                node: app,
+                with: pc
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn link_names_are_unique_per_owner_and_per_subscriber() -> TestResult {
+        let mut net = Network::new();
+        let pc = net.create_node("pc", "computer")?;
+        let (a, b) = (net.create_link("ipc")?, net.create_link("ipc")?);
+        net.add_internal_link(pc, a)?;
+        assert_eq!(
+            net.add_internal_link(pc, b),
+            Err(NetworkError::LinkNameConflict { link: b, with: a })
+        );
+        let dev = net.create_node("dev", "x")?;
+        let (w1, w2) = (net.create_link("wifi")?, net.create_link("wifi")?);
+        net.subscribe(dev, w1)?;
+        assert_eq!(
+            net.subscribe(dev, w2),
+            Err(NetworkError::LinkNameConflict { link: w2, with: w1 })
+        );
+        Ok(())
     }
 }

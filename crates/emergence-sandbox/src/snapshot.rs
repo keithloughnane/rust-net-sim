@@ -147,6 +147,16 @@ impl Snapshot {
         self.link(id).map_or("?", |l| l.name.as_str())
     }
 
+    /// How many nodes have this name.
+    pub(crate) fn nodes_named(&self, name: &str) -> usize {
+        self.nodes.iter().filter(|n| n.name == name).count()
+    }
+
+    /// The first link (in creation order) with this name.
+    pub(crate) fn find_link(&self, name: &str) -> Option<LinkId> {
+        self.links.iter().find(|l| l.name == name).map(|l| l.id)
+    }
+
     /// The first node (in creation order) with this name.
     pub(crate) fn find_node(&self, name: &str) -> Option<NodeId> {
         self.nodes.iter().find(|n| n.name == name).map(|n| n.id)
@@ -162,14 +172,21 @@ impl Snapshot {
         path
     }
 
-    /// Number of nodes nested anywhere below `id`.
+    /// Number of nodes nested anywhere below `id`. Iterative, so a player-built chain thousands
+    /// of levels deep cannot overflow the stack.
     pub(crate) fn descendant_count(&self, id: NodeId) -> usize {
-        self.node(id).map_or(0, |n| {
-            n.children
-                .iter()
-                .map(|&c| 1 + self.descendant_count(c))
-                .sum()
-        })
+        let mut count = 0;
+        let mut stack: Vec<NodeId> = self
+            .node(id)
+            .map(|n| n.children.clone())
+            .unwrap_or_default();
+        while let Some(n) = stack.pop() {
+            count += 1;
+            if let Some(node) = self.node(n) {
+                stack.extend(&node.children);
+            }
+        }
+        count
     }
 }
 

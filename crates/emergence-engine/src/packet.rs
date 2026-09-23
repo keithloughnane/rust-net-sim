@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{NodeId, PacketRoute};
 
 /// The payload of a packet: a kind that says what happened, plus opaque bytes.
@@ -44,12 +46,15 @@ impl PacketId {
 }
 
 /// A message travelling through the network.
+///
+/// Every listener on a link gets its own copy, but the routes and payload are shared between
+/// copies, so a large broadcast costs one payload, not one per listener.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
     pub(crate) id: PacketId,
-    pub(crate) from: PacketRoute,
-    pub(crate) to: PacketRoute,
-    pub(crate) event: Event,
+    pub(crate) from: Arc<PacketRoute>,
+    pub(crate) to: Arc<PacketRoute>,
+    pub(crate) event: Arc<Event>,
     pub(crate) ttl: u8,
     pub(crate) trace: Vec<NodeId>,
 }

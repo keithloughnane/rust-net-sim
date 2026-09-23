@@ -4,6 +4,15 @@ using Emergence.Native;
 
 namespace Emergence
 {
+    /// <summary>How a tick ended.</summary>
+    public enum TickOutcome
+    {
+        /// <summary>Everything due was delivered.</summary>
+        Completed,
+        /// <summary>A hard limit was hit and packets were held back. Pause and inspect.</summary>
+        FuseTripped,
+    }
+
     /// <summary>
     /// A simulation world backed by the native library. Dispose it when finished; the finalizer
     /// is only a safety net.
@@ -33,8 +42,53 @@ namespace Emergence
             }
         }
 
-        /// <summary>Advances the simulation by one tick.</summary>
-        public void Tick() => EmergenceLibrary.Check(NativeMethods.emergence_world_tick(Handle));
+        /// <summary>
+        /// Advances the simulation by one tick. Returns <see cref="TickOutcome.FuseTripped"/> if the
+        /// tick hit a hard limit: the network is running away, so pause and read
+        /// <see cref="FuseReportJson"/>.
+        /// </summary>
+        public TickOutcome Tick()
+        {
+            var status = NativeMethods.emergence_world_tick(Handle);
+            if (status == EmergenceStatus.FuseTripped) return TickOutcome.FuseTripped;
+            EmergenceLibrary.Check(status);
+            return TickOutcome.Completed;
+        }
+
+        /// <summary>Sets the fuse's hard limits. 0 keeps a limit's current value.</summary>
+        public void SetLimits(ulong maxTransmissionsPerTick = 0, ulong maxDeliveriesPerTick = 0,
+            ulong maxPending = 0, ulong maxPayloadBytes = 0) =>
+            EmergenceLibrary.Check(NativeMethods.emergence_world_set_limits(
+                Handle, maxTransmissionsPerTick, maxDeliveriesPerTick, maxPending, maxPayloadBytes));
+
+        /// <summary>
+        /// Whether every packet is recorded in the trace (default on). Off is much cheaper for busy
+        /// networks; alerts and notes are always recorded.
+        /// </summary>
+        public void SetTracePackets(bool enabled) =>
+            EmergenceLibrary.Check(NativeMethods.emergence_world_set_trace_packets(Handle, enabled ? 1u : 0u));
+
+        /// <summary>The world's load and safety counters, as JSON.</summary>
+        public string HealthJson() => TakeString(NativeMethods.emergence_world_health_json);
+
+        /// <summary>Why the fuse tripped on the last tick, as JSON, or "null" if it did not.</summary>
+        public string FuseReportJson() => TakeString(NativeMethods.emergence_world_fuse_report_json);
+
+        private delegate EmergenceStatus StringGetter(EmergenceWorld* world, byte** json);
+
+        private string TakeString(StringGetter getter)
+        {
+            byte* json;
+            EmergenceLibrary.Check(getter(Handle, &json));
+            try
+            {
+                return EmergenceLibrary.FromUtf8(json);
+            }
+            finally
+            {
+                NativeMethods.emergence_string_free(json);
+            }
+        }
 
         /// <summary>The network's root node.</summary>
         public NodeId Root

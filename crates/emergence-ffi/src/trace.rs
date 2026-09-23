@@ -6,7 +6,7 @@ use emergence_engine::{AcceptRule, DropReason, TraceEvent};
 use serde::Serialize;
 
 /// Version of the trace format.
-pub(crate) const FORMAT: u32 = 1;
+pub(crate) const FORMAT: u32 = 2;
 
 #[derive(Serialize)]
 pub(crate) struct Trace {
@@ -50,6 +50,7 @@ enum Entry {
         node: u64,
         text: String,
     },
+    Alert(crate::health::AlertJson),
     /// An event kind this ABI version cannot describe.
     Other,
 }
@@ -69,6 +70,7 @@ fn reason_name(reason: DropReason) -> &'static str {
     match reason {
         DropReason::TtlExpired => "ttl_expired",
         DropReason::NoRecipient => "no_recipient",
+        DropReason::SenderLeftLink => "sender_left_link",
         _ => "other",
     }
 }
@@ -119,6 +121,7 @@ impl Trace {
                     at: at.map(emergence_engine::NodeId::to_raw),
                     reason: reason_name(reason),
                 },
+                TraceEvent::Alert(a) => Entry::Alert(crate::health::alert(&a)),
                 TraceEvent::Note { tick, node, text } => Entry::Note {
                     tick,
                     node: node.to_raw(),

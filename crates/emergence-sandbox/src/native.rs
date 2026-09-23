@@ -20,7 +20,7 @@ use crate::snapshot::{Snapshot, SnapshotError};
 use crate::trace::TraceEntry;
 
 /// ABI version this module was written against (`EMERGENCE_ABI_VERSION` in the header).
-const EXPECTED_ABI_VERSION: u32 = 3;
+const EXPECTED_ABI_VERSION: u32 = 4;
 
 /// Environment variable that overrides where the library is loaded from.
 const LIB_PATH_VAR: &str = "EMERGENCE_LIB";
@@ -29,6 +29,23 @@ const LIB_PATH_VAR: &str = "EMERGENCE_LIB";
 /// this module does not know.
 type Status = u32;
 const STATUS_OK: Status = 0;
+const STATUS_FUSE_TRIPPED: Status = 18;
+
+/// How a tick ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TickResult {
+    Completed,
+    /// The world hit a hard limit and held packets back. The host should pause.
+    FuseTripped,
+}
+
+/// A built-in logic kind offered by the library.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct LogicKind {
+    pub(crate) name: String,
+    /// Deliberately broken, for stress testing.
+    pub(crate) faulty: bool,
+}
 
 /// `EmergenceNodeId` from the header. Also how node IDs appear in the JSON snapshot.
 #[repr(C)]
@@ -83,6 +100,18 @@ pub(crate) enum NativeError {
     InvalidString(NulError),
     Snapshot(SnapshotError),
     Trace(serde_json::Error),
+    /// A problem found by sandbox code rather than the library.
+    Sandbox(String),
+}
+
+impl NativeError {
+    /// The library's status code, if this came from a native call.
+    pub(crate) fn status(&self) -> Option<Status> {
+        match self {
+            Self::Status { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for NativeError {
@@ -99,6 +128,7 @@ impl fmt::Display for NativeError {
             Self::InvalidString(e) => write!(f, "string contains a NUL byte: {e}"),
             Self::Snapshot(e) => write!(f, "bad network snapshot: {e}"),
             Self::Trace(e) => write!(f, "bad trace: {e}"),
+            Self::Sandbox(e) => f.write_str(e),
         }
     }
 }
@@ -145,13 +175,19 @@ struct Api {
         usize,
     ) -> Status,
     drain_trace_json: unsafe extern "C" fn(*mut RawWorld, *mut *mut c_char) -> Status,
+    unsubscribe: unsafe extern "C" fn(*mut RawWorld, NodeId, LinkId) -> Status,
+    disconnect: unsafe extern "C" fn(*mut RawWorld, NodeId, NodeId) -> Status,
+    set_limits: unsafe extern "C" fn(*mut RawWorld, u64, u64, u64, u64) -> Status,
+    set_trace_packets: unsafe extern "C" fn(*mut RawWorld, u32) -> Status,
+    health_json: unsafe extern "C" fn(*mut RawWorld, *mut *mut c_char) -> Status,
+    fuse_report_json: unsafe extern "C" fn(*mut RawWorld, *mut *mut c_char) -> Status,
 }
 
 /// The loaded native library and the function pointers resolved from it.
 pub(crate) struct NativeLibrary {
     path: PathBuf,
     version: String,
-    logic_kinds: Vec<String>,
+    logic_kinds: Vec<LogicKind>,
     api: Api,
     // Declared last so it is dropped (unloaded) after nothing else can use the pointers above.
     _library: Library,
@@ -246,11 +282,29 @@ impl NativeLibrary {
                 drain_trace_json: *library
                     .get(b"emergence_world_drain_trace_json\0")
                     .map_err(load_err)?,
+                unsubscribe: *library
+                    .get(b"emergence_network_unsubscribe\0")
+                    .map_err(load_err)?,
+                disconnect: *library
+                    .get(b"emergence_network_disconnect\0")
+                    .map_err(load_err)?,
+                set_limits: *library
+                    .get(b"emergence_world_set_limits\0")
+                    .map_err(load_err)?,
+                set_trace_packets: *library
+                    .get(b"emergence_world_set_trace_packets\0")
+                    .map_err(load_err)?,
+                health_json: *library
+                    .get(b"emergence_world_health_json\0")
+                    .map_err(load_err)?,
+                fuse_report_json: *library
+                    .get(b"emergence_world_fuse_report_json\0")
+                    .map_err(load_err)?,
             };
             let logic_kinds = *library
                 .get::<extern "C" fn() -> *const c_char>(b"emergence_logic_kinds_json\0")
                 .map_err(load_err)?;
-            let logic_kinds: Vec<String> =
+            let logic_kinds: Vec<LogicKind> =
                 serde_json::from_slice(CStr::from_ptr(logic_kinds()).to_bytes())
                     .map_err(NativeError::Trace)?;
 
@@ -272,8 +326,8 @@ impl NativeLibrary {
         &self.version
     }
 
-    /// Names of the built-in logic kinds the library offers.
-    pub(crate) fn logic_kinds(&self) -> &[String] {
+    /// The built-in logic kinds the library offers.
+    pub(crate) fn logic_kinds(&self) -> &[LogicKind] {
         &self.logic_kinds
     }
 
@@ -315,6 +369,11 @@ impl NativeWorld {
 
     fn api(&self) -> Api {
         self.library.api
+    }
+
+    /// The library this world lives in, for creating sibling worlds.
+    pub(crate) fn library(&self) -> Arc<NativeLibrary> {
+        Arc::clone(&self.library)
     }
 
     fn check(&self, code: Status) -> Result<(), NativeError> {
@@ -372,8 +431,56 @@ impl NativeWorld {
         self.check(unsafe { (self.api().subscribe)(self.handle.as_ptr(), node, link) })
     }
 
-    pub(crate) fn tick(&mut self) -> Result<(), NativeError> {
-        self.check(unsafe { (self.api().world_tick)(self.handle.as_ptr()) })
+    pub(crate) fn tick(&mut self) -> Result<TickResult, NativeError> {
+        let status = unsafe { (self.api().world_tick)(self.handle.as_ptr()) };
+        if status == STATUS_FUSE_TRIPPED {
+            return Ok(TickResult::FuseTripped);
+        }
+        self.check(status).map(|()| TickResult::Completed)
+    }
+
+    pub(crate) fn unsubscribe(&mut self, node: NodeId, link: LinkId) -> Result<(), NativeError> {
+        self.check(unsafe { (self.api().unsubscribe)(self.handle.as_ptr(), node, link) })
+    }
+
+    pub(crate) fn disconnect(&mut self, parent: NodeId, node: NodeId) -> Result<(), NativeError> {
+        self.check(unsafe { (self.api().disconnect)(self.handle.as_ptr(), parent, node) })
+    }
+
+    /// Sets the fuse's limits. 0 keeps a limit's current value.
+    pub(crate) fn set_limits(
+        &mut self,
+        transmissions: u64,
+        deliveries: u64,
+        pending: u64,
+        payload: u64,
+    ) -> Result<(), NativeError> {
+        self.check(unsafe {
+            (self.api().set_limits)(
+                self.handle.as_ptr(),
+                transmissions,
+                deliveries,
+                pending,
+                payload,
+            )
+        })
+    }
+
+    pub(crate) fn set_trace_packets(&mut self, enabled: bool) -> Result<(), NativeError> {
+        self.check(unsafe {
+            (self.api().set_trace_packets)(self.handle.as_ptr(), u32::from(enabled))
+        })
+    }
+
+    pub(crate) fn health(&mut self) -> Result<crate::health::Health, NativeError> {
+        let json = self.take_string(self.api().health_json)?;
+        serde_json::from_slice(&json).map_err(NativeError::Trace)
+    }
+
+    /// Why the fuse tripped on the last tick, if it did.
+    pub(crate) fn fuse_report(&mut self) -> Result<Option<crate::health::FuseReport>, NativeError> {
+        let json = self.take_string(self.api().fuse_report_json)?;
+        serde_json::from_slice(&json).map_err(NativeError::Trace)
     }
 
     pub(crate) fn set_logic(&mut self, node: NodeId, kind: &str) -> Result<(), NativeError> {
@@ -434,6 +541,11 @@ impl NativeWorld {
         Ok(Snapshot::from_json(&json)?)
     }
 }
+
+// SAFETY: a world handle has no thread affinity (the engine's `World` is `Send`), and
+// `NativeWorld` owns its handle exclusively, so moving it to another thread is sound. It is not
+// `Sync`: calls still need `&mut self`.
+unsafe impl Send for NativeWorld {}
 
 impl Drop for NativeWorld {
     fn drop(&mut self) {

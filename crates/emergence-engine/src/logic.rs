@@ -1,8 +1,9 @@
 use std::fmt;
+use std::sync::Arc;
 
 use crate::route::{Hop, names};
 use crate::trace::{TraceEvent, TraceLog};
-use crate::{ControlNode, Event, Link, LinkId, Network, NodeId, Packet, PacketRoute};
+use crate::{ControlNode, Event, Limits, Link, LinkId, Network, NodeId, Packet, PacketRoute};
 
 /// Behaviour attached to a [`ControlNode`]: what it does when packets arrive and as time passes.
 ///
@@ -27,6 +28,26 @@ pub trait ControllerLogic: Send + fmt::Debug {
     fn wants(&self, _packet: &Packet) -> bool {
         false
     }
+
+    /// How this logic passes traffic between the links its node is on. The monitor uses it to
+    /// find loops in the topology before any traffic flows.
+    fn relaying(&self) -> Relaying {
+        Relaying::None
+    }
+}
+
+/// How a logic passes traffic between links, for loop detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Relaying {
+    /// Never passes traffic on.
+    None,
+    /// Passes traffic between its internal and external links only where a packet's route says
+    /// to (a gateway). Route depth bounds this, so routed nodes alone cannot make an endless
+    /// loop, but they can complete one that a flooding relay starts.
+    Routed,
+    /// Passes everything it hears to its other links (a hub or bridge). Any cycle through one of
+    /// these loops.
+    Flooding,
 }
 
 /// Why a node accepted a packet (see the routing rules in the design docs).
@@ -59,6 +80,11 @@ pub enum SendError {
     NothingToReplyTo,
     /// The route would be too deep.
     Route(crate::RouteError),
+    /// The payload or event kind is bigger than [`Limits`] allow.
+    PayloadTooLarge,
+    /// The send queue is full ([`Limits::max_pending`]). The world is overloaded; the packet was
+    /// not sent.
+    QueueFull,
 }
 
 impl fmt::Display for SendError {
@@ -69,6 +95,8 @@ impl fmt::Display for SendError {
             Self::NotOnLink(id) => write!(f, "the node is not on link {id:?}"),
             Self::NothingToReplyTo => f.write_str("there is no received packet to reply to"),
             Self::Route(e) => write!(f, "bad route: {e}"),
+            Self::PayloadTooLarge => f.write_str("the payload or event kind is too large"),
+            Self::QueueFull => f.write_str("the send queue is full"),
         }
     }
 }
@@ -80,36 +108,66 @@ impl std::error::Error for SendError {}
 pub(crate) struct Outgoing {
     pub(crate) sender: NodeId,
     pub(crate) via: LinkId,
-    pub(crate) from: PacketRoute,
-    pub(crate) to: PacketRoute,
-    pub(crate) event: Event,
+    pub(crate) from: Arc<PacketRoute>,
+    pub(crate) to: Arc<PacketRoute>,
+    pub(crate) event: Arc<Event>,
     pub(crate) ttl: u8,
     pub(crate) trace: Vec<NodeId>,
 }
 
-/// Builds an [`Outgoing`] from `sender` on `via`, checking the sender may use the link.
+/// Longest event kind allowed, in bytes.
+pub(crate) const MAX_KIND_LEN: usize = 64;
+
+/// Builds an [`Outgoing`] from `sender` on `via`, checking the sender may use the link and the
+/// event fits the limits.
 pub(crate) fn outgoing(
     network: &Network,
+    limits: &Limits,
     sender: NodeId,
     via: LinkId,
-    from: Option<PacketRoute>,
-    to: PacketRoute,
-    event: Event,
+    from: Option<Arc<PacketRoute>>,
+    to: Arc<PacketRoute>,
+    event: Arc<Event>,
 ) -> Result<Outgoing, SendError> {
     let node = network.node(sender).ok_or(SendError::UnknownNode(sender))?;
     let link = network.link(via).ok_or(SendError::UnknownLink(via))?;
     if !network.can_use_link(sender, via) {
         return Err(SendError::NotOnLink(via));
     }
+    if event.data.len() > limits.max_payload_bytes || event.kind.len() > MAX_KIND_LEN {
+        return Err(SendError::PayloadTooLarge);
+    }
     Ok(Outgoing {
         sender,
         via,
-        from: from.unwrap_or_else(|| PacketRoute::new(node.name(), link.name())),
+        from: from.unwrap_or_else(|| Arc::new(PacketRoute::new(node.name(), link.name()))),
         to,
         event,
         ttl: Packet::DEFAULT_TTL,
         trace: Vec::new(),
     })
+}
+
+/// The queue of packets waiting for the next tick, with its size limit.
+#[derive(Debug)]
+pub(crate) struct SendQueue<'a> {
+    pub(crate) items: &'a mut Vec<Outgoing>,
+    pub(crate) limits: &'a Limits,
+    /// Packets from the current batch not yet delivered, which count against the limit.
+    pub(crate) reserved: usize,
+    /// Sends refused because the queue was full.
+    pub(crate) refused: &'a mut u64,
+}
+
+impl SendQueue<'_> {
+    pub(crate) fn push(&mut self, out: Outgoing) -> Result<(), SendError> {
+        if self.items.len() + self.reserved >= self.limits.max_pending {
+            *self.refused += 1;
+            return Err(SendError::QueueFull);
+        }
+        self.items.push(out);
+        Ok(())
+    }
 }
 
 /// What a [`ControllerLogic`] can see and do while it runs.
@@ -120,7 +178,7 @@ pub struct Context<'a> {
     pub(crate) tick: u64,
     pub(crate) arrived_on: Option<LinkId>,
     pub(crate) accepted_by: Option<AcceptRule>,
-    pub(crate) pending: &'a mut Vec<Outgoing>,
+    pub(crate) queue: SendQueue<'a>,
     pub(crate) trace: &'a mut TraceLog,
 }
 
@@ -190,9 +248,16 @@ impl Context<'_> {
     ///
     /// Fails if this node can neither subscribe to nor own `via`.
     pub fn send(&mut self, via: LinkId, to: PacketRoute, event: Event) -> Result<(), SendError> {
-        let out = outgoing(self.network, self.node, via, None, to, event)?;
-        self.pending.push(out);
-        Ok(())
+        let out = outgoing(
+            self.network,
+            self.queue.limits,
+            self.node,
+            via,
+            None,
+            Arc::new(to),
+            Arc::new(event),
+        )?;
+        self.queue.push(out)
     }
 
     /// Replies to `packet` with `event`, on the link it arrived on.
@@ -202,7 +267,16 @@ impl Context<'_> {
     /// Fails outside `on_received`.
     pub fn reply(&mut self, packet: &Packet, event: Event) -> Result<(), SendError> {
         let via = self.arrived_on.ok_or(SendError::NothingToReplyTo)?;
-        self.send(via, packet.from().clone(), event)
+        let out = outgoing(
+            self.network,
+            self.queue.limits,
+            self.node,
+            via,
+            None,
+            Arc::clone(&packet.from),
+            Arc::new(event),
+        )?;
+        self.queue.push(out)
     }
 
     /// Re-sends `packet`'s event with new addresses, keeping its remaining TTL and trace so loop
@@ -220,16 +294,37 @@ impl Context<'_> {
     ) -> Result<(), SendError> {
         let mut out = outgoing(
             self.network,
+            self.queue.limits,
             self.node,
             via,
-            Some(from),
-            to,
-            packet.event().clone(),
+            Some(Arc::new(from)),
+            Arc::new(to),
+            Arc::clone(&packet.event),
         )?;
         out.ttl = packet.ttl();
         out.trace = packet.trace().to_vec();
-        self.pending.push(out);
-        Ok(())
+        self.queue.push(out)
+    }
+
+    /// Re-sends `packet` unchanged (same addresses, event, TTL and trace) on another link, the
+    /// way a hub or bridge passes traffic through.
+    ///
+    /// # Errors
+    ///
+    /// Fails if this node can neither subscribe to nor own `via`.
+    pub fn relay(&mut self, packet: &Packet, via: LinkId) -> Result<(), SendError> {
+        let mut out = outgoing(
+            self.network,
+            self.queue.limits,
+            self.node,
+            via,
+            Some(Arc::clone(&packet.from)),
+            Arc::clone(&packet.to),
+            Arc::clone(&packet.event),
+        )?;
+        out.ttl = packet.ttl();
+        out.trace = packet.trace().to_vec();
+        self.queue.push(out)
     }
 
     /// `route` with this node's own address on `via` added in front, so replies come back

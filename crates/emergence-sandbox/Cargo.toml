@@ -2,6 +2,7 @@
 name = "emergence-sandbox"
 description = "Interactive test harness for the Emergence Engine."
 publish = false
+default-run = "emergence-sandbox"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

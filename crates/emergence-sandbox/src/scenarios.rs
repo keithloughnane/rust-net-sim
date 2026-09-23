@@ -2,7 +2,7 @@
 
 use crate::native::{LinkId, NativeError, NativeWorld, NodeId};
 
-type BuildResult = Result<(), NativeError>;
+pub(crate) type BuildResult = Result<(), NativeError>;
 
 /// A named test network.
 #[derive(Debug, Clone, Copy)]
@@ -14,8 +14,7 @@ pub(crate) struct Scenario {
 
 impl Scenario {
     pub(crate) fn build(&self, world: &mut NativeWorld) -> BuildResult {
-        let root = world.root()?;
-        (self.build)(&mut Builder { world, root })
+        (self.build)(&mut Builder::new(world)?)
     }
 }
 
@@ -61,21 +60,30 @@ const BEACON: &str = "beacon";
 const SCANNER: &str = "scanner";
 
 /// Convenience layer over [`NativeWorld`] for building networks.
-struct Builder<'w> {
-    world: &'w mut NativeWorld,
-    root: NodeId,
+pub(crate) struct Builder<'w> {
+    pub(crate) world: &'w mut NativeWorld,
+    pub(crate) root: NodeId,
 }
 
-impl Builder<'_> {
+impl<'w> Builder<'w> {
+    pub(crate) fn new(world: &'w mut NativeWorld) -> Result<Self, NativeError> {
+        let root = world.root()?;
+        Ok(Self { world, root })
+    }
+
     /// A link owned by the root: a Wi-Fi zone, a phone line, a street.
-    fn world_link(&mut self, name: &str) -> Result<LinkId, NativeError> {
+    pub(crate) fn world_link(&mut self, name: &str) -> Result<LinkId, NativeError> {
         let link = self.world.create_link(name)?;
         self.world.add_internal_link(self.root, link)?;
         Ok(link)
     }
 
     /// A link owned by `owner`, for its children.
-    fn internal_link(&mut self, owner: NodeId, name: &str) -> Result<LinkId, NativeError> {
+    pub(crate) fn internal_link(
+        &mut self,
+        owner: NodeId,
+        name: &str,
+    ) -> Result<LinkId, NativeError> {
         let link = self.world.create_link(name)?;
         self.world.add_internal_link(owner, link)?;
         Ok(link)
@@ -83,7 +91,7 @@ impl Builder<'_> {
 
     /// A node nested in `parent` and attached to each of `links` (the first also becomes one of
     /// `parent`'s internal links if it is not already).
-    fn node(
+    pub(crate) fn node(
         &mut self,
         parent: NodeId,
         name: &str,
@@ -99,12 +107,12 @@ impl Builder<'_> {
     }
 
     /// Attaches a built-in logic.
-    fn logic(&mut self, node: NodeId, kind: &str) -> BuildResult {
+    pub(crate) fn logic(&mut self, node: NodeId, kind: &str) -> BuildResult {
         self.world.set_logic(node, kind)
     }
 
     /// A node with a logic attached.
-    fn device(
+    pub(crate) fn device(
         &mut self,
         parent: NodeId,
         name: &str,
@@ -120,7 +128,7 @@ impl Builder<'_> {
     /// A computer: the standard services plus `apps`, all on the computer's own `ipc` bus.
     /// The computer is a gateway, everything inside answers pings, and an app called
     /// `net-scan` scans the computer's networks. Returns the computer and its bus.
-    fn computer(
+    pub(crate) fn computer(
         &mut self,
         parent: NodeId,
         name: &str,

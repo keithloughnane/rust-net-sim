@@ -22,7 +22,7 @@ namespace Emergence.Native
         /// <summary>
         ///  Version of the C ABI. Bump whenever an exported signature or type layout changes.
         /// </summary>
-        internal const uint EMERGENCE_ABI_VERSION = 3;
+        internal const uint EMERGENCE_ABI_VERSION = 4;
 
 
 
@@ -84,6 +84,11 @@ namespace Emergence.Native
 
         /// <summary>
         ///  Advances the world by one tick.
+        ///
+        ///  Returns [`EmergenceStatus::FuseTripped`] if the tick hit a hard limit (see
+        ///  [`emergence_world_set_limits`]). The world is still consistent; undelivered packets stay
+        ///  queued. The host decides what to do: normally pause and show
+        ///  [`emergence_world_fuse_report_json`].
         ///
         ///  # Safety
         ///
@@ -212,11 +217,57 @@ namespace Emergence.Native
         internal static extern EmergenceStatus emergence_network_snapshot_json(EmergenceWorld* world, byte** out_json);
 
         /// <summary>
-        ///  Returns the names of the built-in logic kinds as a static JSON array of strings, such as
-        ///  `["responder","gateway"]`. Do not free it.
+        ///  Returns the built-in logic kinds as a static JSON array, such as
+        ///  `[{"name":"responder","faulty":false}, ...]`. Faulty kinds deliberately misbehave, for stress
+        ///  testing. Do not free the string.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "emergence_logic_kinds_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern byte* emergence_logic_kinds_json();
+
+        /// <summary>
+        ///  Sets the fuse's hard limits. 0 keeps a limit's current value.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_set_limits", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_set_limits(EmergenceWorld* world, ulong max_transmissions_per_tick, ulong max_deliveries_per_tick, ulong max_pending, ulong max_payload_bytes);
+
+        /// <summary>
+        ///  Turns recording of every packet in the trace on (non-zero, the default) or off (0). Off
+        ///  makes busy simulations much cheaper; alerts and notes are always recorded.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_set_trace_packets", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_set_trace_packets(EmergenceWorld* world, uint enabled);
+
+        /// <summary>
+        ///  Writes the world's load and safety counters as JSON to `out_json`. Free it with
+        ///  [`emergence_string_free`].
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+        ///  or valid for a pointer-sized write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_health_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_health_json(EmergenceWorld* world, byte** out_json);
+
+        /// <summary>
+        ///  Writes why the fuse tripped on the last tick as JSON to `out_json` (`null` if it did not).
+        ///  Free it with [`emergence_string_free`].
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+        ///  or valid for a pointer-sized write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_fuse_report_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_fuse_report_json(EmergenceWorld* world, byte** out_json);
 
         /// <summary>
         ///  Attaches a built-in logic to `node` by name (see [`emergence_logic_kinds_json`]). An empty
@@ -360,6 +411,28 @@ namespace Emergence.Native
         ///  The node is neither subscribed to the link nor its owner, so it cannot send on it.
         /// </summary>
         NotOnLink = 13,
+        /// <summary>
+        ///  A node or link name is empty, too long, reserved, or contains route syntax (`@`, `/`).
+        /// </summary>
+        InvalidName = 14,
+        /// <summary>
+        ///  Another node on the same link already has that name, or the node already uses another
+        ///  link with that name.
+        /// </summary>
+        NameConflict = 15,
+        /// <summary>
+        ///  The send queue is full; the world is overloaded. Nothing was sent.
+        /// </summary>
+        QueueFull = 16,
+        /// <summary>
+        ///  The event payload or kind is larger than the limits allow.
+        /// </summary>
+        PayloadTooLarge = 17,
+        /// <summary>
+        ///  Not an error: the tick ran, but hit a hard limit and held packets back. The network is
+        ///  running away. Pause and read [`emergence_world_fuse_report_json`].
+        /// </summary>
+        FuseTripped = 18,
         /// <summary>
         ///  The operation failed for a reason this ABI version does not have a code for.
         /// </summary>

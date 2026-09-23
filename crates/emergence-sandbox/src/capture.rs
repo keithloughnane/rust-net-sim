@@ -10,7 +10,8 @@ use std::path::PathBuf;
 
 use eframe::egui;
 
-/// Frames to wait before capturing, so the layout has time to settle.
+/// Frames to wait before capturing, so the layout has time to settle. Override with
+/// `EMERGENCE_SCREENSHOT_FRAMES`.
 const SETTLE_FRAMES: u32 = 150;
 
 /// Startup options read from the environment.
@@ -24,6 +25,16 @@ pub(crate) struct Options {
     pub(crate) screenshot: Option<PathBuf>,
     /// Simulation speed in ticks per second.
     pub(crate) speed: Option<f32>,
+    /// Name of a stress test to load into the viewer instead of a scenario.
+    pub(crate) watch: Option<String>,
+    /// Start playing, even when watching a test (which normally starts paused).
+    pub(crate) play: bool,
+    /// Bottom tab to show: `traffic`, `alerts` or `tests`.
+    pub(crate) tab: Option<String>,
+    /// Run the whole stress-test checklist at startup.
+    pub(crate) run_tests: bool,
+    /// Frames to wait before taking the screenshot.
+    pub(crate) frames: Option<u32>,
 }
 
 impl Options {
@@ -35,6 +46,13 @@ impl Options {
             speed: std::env::var("EMERGENCE_SPEED")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            watch: std::env::var("EMERGENCE_WATCH").ok(),
+            play: std::env::var_os("EMERGENCE_PLAY").is_some(),
+            tab: std::env::var("EMERGENCE_TAB").ok(),
+            run_tests: std::env::var_os("EMERGENCE_RUN_TESTS").is_some(),
+            frames: std::env::var("EMERGENCE_SCREENSHOT_FRAMES")
+                .ok()
+                .and_then(|s| s.parse().ok()),
         }
     }
 }
@@ -44,14 +62,16 @@ impl Options {
 pub(crate) struct Capture {
     path: PathBuf,
     frames: u32,
+    wait: u32,
     requested: bool,
 }
 
 impl Capture {
-    pub(crate) fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf, wait: Option<u32>) -> Self {
         Self {
             path,
             frames: 0,
+            wait: wait.unwrap_or(SETTLE_FRAMES),
             requested: false,
         }
     }
@@ -59,7 +79,7 @@ impl Capture {
     /// Call once per frame.
     pub(crate) fn update(&mut self, ctx: &egui::Context) {
         self.frames += 1;
-        if !self.requested && self.frames >= SETTLE_FRAMES {
+        if !self.requested && self.frames >= self.wait {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             self.requested = true;
         }
