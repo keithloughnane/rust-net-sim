@@ -332,6 +332,26 @@ impl Network {
         Ok(())
     }
 
+    /// Whether `node` can transmit on `link`: it subscribes to it or owns it.
+    #[must_use]
+    pub fn can_use_link(&self, node: NodeId, link: LinkId) -> bool {
+        self.nodes
+            .get(node)
+            .is_some_and(|n| n.subscriptions.contains(&link) || n.internal_links.contains(&link))
+    }
+
+    /// The first link called `name` that `node` can transmit on: its subscriptions first, then
+    /// the links it owns.
+    #[must_use]
+    pub fn usable_link_named(&self, node: NodeId, name: &str) -> Option<LinkId> {
+        let n = self.nodes.get(node)?;
+        n.subscriptions
+            .iter()
+            .chain(&n.internal_links)
+            .copied()
+            .find(|&l| self.links.get(l).is_some_and(|l| l.name == name))
+    }
+
     /// `node`, then its parent, then its grandparent, up to the top of its tree.
     pub fn ancestors_and_self(&self, node: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         std::iter::successors(self.nodes.contains_key(node).then_some(node), |&n| {

@@ -54,6 +54,12 @@ const COMPUTER_SERVICES: &[(&str, &str)] = &[
 /// Conventional name of a composite node's own internal bus.
 const IPC: &str = "ipc";
 
+// Built-in logic kinds (see `emergence_engine::LOGIC_KINDS`).
+const RESPONDER: &str = "responder";
+const GATEWAY: &str = "gateway";
+const BEACON: &str = "beacon";
+const SCANNER: &str = "scanner";
+
 /// Convenience layer over [`NativeWorld`] for building networks.
 struct Builder<'w> {
     world: &'w mut NativeWorld,
@@ -92,8 +98,28 @@ impl Builder<'_> {
         Ok(node)
     }
 
+    /// Attaches a built-in logic.
+    fn logic(&mut self, node: NodeId, kind: &str) -> BuildResult {
+        self.world.set_logic(node, kind)
+    }
+
+    /// A node with a logic attached.
+    fn device(
+        &mut self,
+        parent: NodeId,
+        name: &str,
+        kind: &str,
+        links: &[LinkId],
+        logic: &str,
+    ) -> Result<NodeId, NativeError> {
+        let node = self.node(parent, name, kind, links)?;
+        self.logic(node, logic)?;
+        Ok(node)
+    }
+
     /// A computer: the standard services plus `apps`, all on the computer's own `ipc` bus.
-    /// Returns the computer and its bus.
+    /// The computer is a gateway, everything inside answers pings, and an app called
+    /// `net-scan` scans the computer's networks. Returns the computer and its bus.
     fn computer(
         &mut self,
         parent: NodeId,
@@ -101,13 +127,18 @@ impl Builder<'_> {
         links: &[LinkId],
         apps: &[&str],
     ) -> Result<(NodeId, LinkId), NativeError> {
-        let pc = self.node(parent, name, "computer", links)?;
+        let pc = self.device(parent, name, "computer", links, GATEWAY)?;
         let ipc = self.internal_link(pc, IPC)?;
         for &(service, kind) in COMPUTER_SERVICES {
-            self.node(pc, service, kind, &[ipc])?;
+            self.device(pc, service, kind, &[ipc], RESPONDER)?;
         }
         for &app in apps {
-            self.node(pc, app, "app", &[ipc])?;
+            let logic = if app == "net-scan" {
+                SCANNER
+            } else {
+                RESPONDER
+            };
+            self.device(pc, app, "app", &[ipc], logic)?;
         }
         Ok((pc, ipc))
     }
@@ -123,8 +154,8 @@ fn office(b: &mut Builder<'_>) -> BuildResult {
     let npc_range = b.world_link("--")?;
     b.world_link("spare-cable")?; // Owned but unused, to show an empty link.
 
-    b.node(root, "router", "router", &[lan, wifi, isp])?;
-    b.node(root, "modem", "modem", &[phone_line, isp])?;
+    b.device(root, "router", "router", &[lan, wifi, isp], BEACON)?;
+    b.device(root, "modem", "modem", &[phone_line, isp], RESPONDER)?;
     b.computer(root, "pc-reception", &[lan], &["mail", "calendar"])?;
     b.computer(
         root,
@@ -135,25 +166,25 @@ fn office(b: &mut Builder<'_>) -> BuildResult {
     b.computer(root, "laptop", &[wifi, street], &["browser"])?;
 
     // A rack groups servers behind its own backplane, one level deeper.
-    let rack = b.node(root, "server-rack", "rack", &[lan])?;
+    let rack = b.device(root, "server-rack", "rack", &[lan], GATEWAY)?;
     let backplane = b.internal_link(rack, "backplane")?;
     b.computer(rack, "srv-files", &[backplane], &["smb-share"])?;
     b.computer(rack, "srv-auth", &[backplane], &["directory"])?;
     b.computer(rack, "srv-backup", &[backplane], &["scheduler"])?;
 
-    b.node(root, "desk-phone", "phone", &[phone_line])?;
+    b.device(root, "desk-phone", "phone", &[phone_line], BEACON)?;
 
     // The player carries a personal-area network: an inventory with devices inside it.
-    let player = b.node(root, "player", "player", &[street])?;
+    let player = b.device(root, "player", "player", &[street], GATEWAY)?;
     let pan = b.internal_link(player, "⊙PAN")?;
-    let inventory = b.node(player, "inventory", "inventory", &[pan])?;
+    let inventory = b.device(player, "inventory", "inventory", &[pan], GATEWAY)?;
     let pocket = b.internal_link(inventory, "pocket")?;
-    b.node(inventory, "pager", "device", &[pocket])?;
-    b.node(inventory, "rf-scanner", "device", &[pocket])?;
-    b.node(player, "phone", "phone", &[pan, street])?;
+    b.device(inventory, "pager", "device", &[pocket], RESPONDER)?;
+    b.device(inventory, "rf-scanner", "device", &[pocket], SCANNER)?;
+    b.device(player, "phone", "phone", &[pan, street], BEACON)?;
 
-    b.node(root, "npc-guard", "npc", &[npc_range])?;
-    b.node(root, "npc-cleaner", "npc", &[npc_range])?;
+    b.device(root, "npc-guard", "npc", &[npc_range], BEACON)?;
+    b.device(root, "npc-cleaner", "npc", &[npc_range], RESPONDER)?;
     Ok(())
 }
 
@@ -166,9 +197,9 @@ fn single_computer(b: &mut Builder<'_>) -> BuildResult {
         &["fileman", "terminal", "browser", "mail", "net-scan"],
     )?;
     // An app that is itself a container: a VM host with a whole computer inside it.
-    let host = b.node(pc, "vm-host", "app", &[ipc])?;
+    let host = b.device(pc, "vm-host", "app", &[ipc], GATEWAY)?;
     let vm_net = b.internal_link(host, "vm-net")?;
-    b.computer(host, "vm-guest", &[vm_net], &["legacy-db"])?;
+    b.computer(host, "vm-guest", &[vm_net], &["legacy-db", "net-scan"])?;
     Ok(())
 }
 
@@ -180,14 +211,18 @@ fn city_block(b: &mut Builder<'_>) -> BuildResult {
     for building in 0..8 {
         let street = if building < 4 { street_a } else { street_b };
         let name = format!("building-{}", building + 1);
-        let bldg = b.node(root, &name, "building", &[fibre, street])?;
+        let bldg = b.device(root, &name, "building", &[fibre, street], GATEWAY)?;
         let lan = b.internal_link(bldg, "lan")?;
         for floor in 0..6 {
             b.computer(
                 bldg,
                 &format!("pc-{}{:02}", building + 1, floor + 1),
                 &[lan],
-                &["mail"],
+                if floor == 0 {
+                    &["mail", "net-scan"]
+                } else {
+                    &["mail"]
+                },
             )?;
         }
     }
@@ -209,7 +244,8 @@ fn mesh(b: &mut Builder<'_>) -> BuildResult {
         let mut mine: Vec<LinkId> = (0..count).map(|_| links[next(links.len())]).collect();
         mine.sort_unstable();
         mine.dedup();
-        b.node(b.root, &format!("device-{i:02}"), "device", &mine)?;
+        let logic = if i % 6 == 0 { BEACON } else { RESPONDER };
+        b.device(b.root, &format!("device-{i:02}"), "device", &mine, logic)?;
     }
     Ok(())
 }

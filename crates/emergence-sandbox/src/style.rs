@@ -9,6 +9,7 @@ pub(crate) const NODE_BG_DIM: Color32 = Color32::from_rgb(22, 25, 31);
 pub(crate) const NODE_BORDER: Color32 = Color32::from_rgb(88, 96, 112);
 pub(crate) const TEXT: Color32 = Color32::from_rgb(222, 226, 234);
 pub(crate) const TEXT_WEAK: Color32 = Color32::from_rgb(120, 128, 142);
+pub(crate) const DROP: Color32 = Color32::from_rgb(239, 83, 80);
 
 /// Distinct hues that read well on a dark background.
 const PALETTE: [Color32; 10] = [
@@ -44,4 +45,13 @@ pub(crate) fn link_color(name: &str) -> Color32 {
 /// Accent colour for a node kind.
 pub(crate) fn kind_color(kind: &str) -> Color32 {
     pick(kind, 0x9E37_79B9)
+}
+
+/// Colour for an event kind. The built-in ping/pong get fixed, contrasting colours.
+pub(crate) fn event_color(kind: &str) -> Color32 {
+    match kind {
+        "ping" => Color32::from_rgb(77, 208, 225),
+        "pong" => Color32::from_rgb(255, 183, 77),
+        other => pick(other, 0x517C_C1B7),
+    }
 }

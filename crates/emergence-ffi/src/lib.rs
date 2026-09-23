@@ -22,14 +22,18 @@
 #![allow(unsafe_code)] // Exporting a C ABI is unsafe by nature; keep it confined to this crate.
 
 mod snapshot;
+mod trace;
 
 use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::OnceLock;
 
-use emergence_engine::{LinkId, NetworkError, NodeId, World};
+use emergence_engine::{
+    Event, LOGIC_KINDS, LinkId, LogicError, NetworkError, NodeId, PacketRoute, SendError, World,
+};
 
 /// Version of the C ABI. Bump whenever an exported signature or type layout changes.
-pub const EMERGENCE_ABI_VERSION: u32 = 2;
+pub const EMERGENCE_ABI_VERSION: u32 = 3;
 
 static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 
@@ -59,12 +63,18 @@ pub enum EmergenceStatus {
     LinkOwnedElsewhere = 9,
     /// The node is not a child of the given parent.
     NotAChild = 10,
+    /// No built-in logic has that name.
+    UnknownLogic = 11,
+    /// A route string could not be parsed, or a route would be too deep.
+    InvalidRoute = 12,
+    /// The node is neither subscribed to the link nor its owner, so it cannot send on it.
+    NotOnLink = 13,
     /// The operation failed for a reason this ABI version does not have a code for.
     Failed = 255,
 }
 
 impl EmergenceStatus {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 15] = [
         Self::Ok,
         Self::NullPointer,
         Self::Panic,
@@ -76,6 +86,9 @@ impl EmergenceStatus {
         Self::IsRoot,
         Self::LinkOwnedElsewhere,
         Self::NotAChild,
+        Self::UnknownLogic,
+        Self::InvalidRoute,
+        Self::NotOnLink,
         Self::Failed,
     ];
 
@@ -92,6 +105,9 @@ impl EmergenceStatus {
             Self::IsRoot => c"the root node cannot have a parent",
             Self::LinkOwnedElsewhere => c"the link is already internal to another node",
             Self::NotAChild => c"the node is not a child of that parent",
+            Self::UnknownLogic => c"no built-in logic has that name",
+            Self::InvalidRoute => c"invalid route",
+            Self::NotOnLink => c"the node is not on that link",
             Self::Failed => c"the operation failed",
         }
     }
@@ -112,9 +128,31 @@ impl From<NetworkError> for EmergenceStatus {
     }
 }
 
-impl From<Result<(), NetworkError>> for EmergenceStatus {
-    fn from(result: Result<(), NetworkError>) -> Self {
-        result.map_or_else(Self::from, |()| Self::Ok)
+impl From<LogicError> for EmergenceStatus {
+    fn from(error: LogicError) -> Self {
+        match error {
+            LogicError::UnknownNode(_) => Self::UnknownNode,
+            LogicError::UnknownKind(_) => Self::UnknownLogic,
+            _ => Self::Failed,
+        }
+    }
+}
+
+impl From<SendError> for EmergenceStatus {
+    fn from(error: SendError) -> Self {
+        match error {
+            SendError::UnknownNode(_) => Self::UnknownNode,
+            SendError::UnknownLink(_) => Self::UnknownLink,
+            SendError::NotOnLink(_) => Self::NotOnLink,
+            SendError::Route(_) => Self::InvalidRoute,
+            _ => Self::Failed,
+        }
+    }
+}
+
+impl<E: Into<Self>> From<Result<(), E>> for EmergenceStatus {
+    fn from(result: Result<(), E>) -> Self {
+        result.map_or_else(Into::into, |()| Self::Ok)
     }
 }
 
@@ -551,17 +589,153 @@ pub unsafe extern "C" fn emergence_network_snapshot_json(
     // SAFETY: forwarded from this function's contract.
     unsafe {
         with_world(world, |world| {
-            let Ok(json) = serde_json::to_string(&snapshot::Snapshot::of(world.network())) else {
-                return EmergenceStatus::Failed;
-            };
-            // JSON escapes control characters, so it can never contain an interior NUL.
-            let Ok(json) = CString::new(json) else {
-                return EmergenceStatus::Failed;
-            };
-            out_json.write(json.into_raw());
-            EmergenceStatus::Ok
+            write_json(&snapshot::Snapshot::of(world), out_json)
         })
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Logic and traffic
+// ---------------------------------------------------------------------------------------------
+
+/// Returns the names of the built-in logic kinds as a static JSON array of strings, such as
+/// `["responder","gateway"]`. Do not free it.
+#[unsafe(no_mangle)]
+pub extern "C" fn emergence_logic_kinds_json() -> *const c_char {
+    static KINDS: OnceLock<CString> = OnceLock::new();
+    KINDS
+        .get_or_init(|| {
+            let json = serde_json::to_string(LOGIC_KINDS).unwrap_or_else(|_| "[]".into());
+            CString::new(json).unwrap_or_default()
+        })
+        .as_ptr()
+}
+
+/// Attaches a built-in logic to `node` by name (see [`emergence_logic_kinds_json`]). An empty
+/// string or `"none"` removes the node's logic.
+///
+/// # Safety
+///
+/// `world` must be null or a live handle, not in use on another thread. `kind` must be null or
+/// a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emergence_world_set_logic(
+    world: *mut EmergenceWorld,
+    node: EmergenceNodeId,
+    kind: *const c_char,
+) -> EmergenceStatus {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        with_world(world, |world| match borrow_str(kind) {
+            Ok(kind) => world.set_logic_kind(node.into(), kind).into(),
+            Err(status) => status,
+        })
+    }
+}
+
+/// Queues an event from `node`, as if its own logic had sent it. It is delivered on the next
+/// [`emergence_world_tick`].
+///
+/// - `via_link` names the link to transmit on: one `node` subscribes to or owns.
+/// - `to_route` is the destination in route text form: `node@link`, or several hops joined by
+///   `/` such as `pc-1@wifi/fileman@ipc`. `*` addresses everyone, `^` the parent.
+/// - `data` may be null when `data_len` is 0.
+///
+/// # Safety
+///
+/// `world` must be null or a live handle, not in use on another thread. The strings must be
+/// null or NUL-terminated. `data` must be null or valid for `data_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emergence_world_send(
+    world: *mut EmergenceWorld,
+    node: EmergenceNodeId,
+    via_link: *const c_char,
+    to_route: *const c_char,
+    event_kind: *const c_char,
+    data: *const u8,
+    data_len: usize,
+) -> EmergenceStatus {
+    if data.is_null() && data_len != 0 {
+        return EmergenceStatus::NullPointer;
+    }
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        with_world(world, |world| {
+            let (via, to, kind) = match (
+                borrow_str(via_link),
+                borrow_str(to_route),
+                borrow_str(event_kind),
+            ) {
+                (Ok(v), Ok(t), Ok(k)) => (v, t, k),
+                (Err(s), _, _) | (_, Err(s), _) | (_, _, Err(s)) => return s,
+            };
+            let Ok(to) = to.parse::<PacketRoute>() else {
+                return EmergenceStatus::InvalidRoute;
+            };
+            let node: NodeId = node.into();
+            if world.network().node(node).is_none() {
+                return EmergenceStatus::UnknownNode;
+            }
+            let Some(via) = world.network().usable_link_named(node, via) else {
+                return EmergenceStatus::NotOnLink;
+            };
+            let bytes = if data_len == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(data, data_len).to_vec()
+            };
+            world
+                .send(node, via, to, Event::with_data(kind, bytes))
+                .into()
+        })
+    }
+}
+
+/// Writes a JSON description of everything that happened since the last call (packets sent,
+/// delivered and dropped, and notes from logic) to `out_json`, and clears it. Free the string
+/// with [`emergence_string_free`].
+///
+/// The format is documented in `crates/emergence-ffi/src/trace.rs` and carries its own
+/// `"format"` version number. The library keeps a bounded buffer; drain it regularly.
+///
+/// # Safety
+///
+/// `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+/// or valid for a pointer-sized write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emergence_world_drain_trace_json(
+    world: *mut EmergenceWorld,
+    out_json: *mut *mut c_char,
+) -> EmergenceStatus {
+    if out_json.is_null() {
+        return EmergenceStatus::NullPointer;
+    }
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        with_world(world, |world| {
+            let events = world.drain_trace();
+            let trace = trace::Trace::of(events, world.trace_discarded());
+            write_json(&trace, out_json)
+        })
+    }
+}
+
+/// Serializes `value` and hands ownership of the string to the caller through `out`.
+///
+/// # Safety
+///
+/// `out` must be valid for a pointer-sized write.
+unsafe fn write_json(value: &impl serde::Serialize, out: *mut *mut c_char) -> EmergenceStatus {
+    let Ok(json) = serde_json::to_string(value) else {
+        return EmergenceStatus::Failed;
+    };
+    // JSON escapes control characters, so it can never contain an interior NUL.
+    let Ok(json) = CString::new(json) else {
+        return EmergenceStatus::Failed;
+    };
+    // SAFETY: the caller guarantees `out` is writable.
+    unsafe { out.write(json.into_raw()) };
+    EmergenceStatus::Ok
 }
 
 #[cfg(test)]
@@ -747,5 +921,136 @@ mod tests {
         // SAFETY: returns a static NUL-terminated string.
         let unknown = unsafe { CStr::from_ptr(emergence_status_message(12345)) };
         assert_eq!(unknown, c"unknown status");
+    }
+
+    impl TestWorld {
+        fn drain_trace(&self) -> serde_json::Value {
+            let mut json = ptr::null_mut();
+            // SAFETY: live world, valid out-pointer; the string is freed below.
+            unsafe {
+                assert_eq!(
+                    emergence_world_drain_trace_json(self.0, &raw mut json),
+                    EmergenceStatus::Ok
+                );
+                let value = serde_json::from_slice(CStr::from_ptr(json).to_bytes());
+                emergence_string_free(json);
+                value.unwrap_or_default()
+            }
+        }
+    }
+
+    #[test]
+    fn ping_through_the_abi_gets_a_pong() {
+        let world = TestWorld::new();
+        let (root, a, b, wifi) = (
+            world.root(),
+            world.node(c"a"),
+            world.node(c"b"),
+            world.link(c"wifi"),
+        );
+        // SAFETY: live world, valid strings; data is null with length 0.
+        unsafe {
+            assert_eq!(
+                emergence_network_connect(world.0, root, a, wifi),
+                EmergenceStatus::Ok
+            );
+            assert_eq!(
+                emergence_network_connect(world.0, root, b, wifi),
+                EmergenceStatus::Ok
+            );
+            assert_eq!(
+                emergence_world_set_logic(world.0, b, c"responder".as_ptr()),
+                EmergenceStatus::Ok
+            );
+            let data = b"hello";
+            assert_eq!(
+                emergence_world_send(
+                    world.0,
+                    a,
+                    c"wifi".as_ptr(),
+                    c"b@wifi".as_ptr(),
+                    c"ping".as_ptr(),
+                    data.as_ptr(),
+                    data.len()
+                ),
+                EmergenceStatus::Ok
+            );
+            emergence_world_tick(world.0);
+            emergence_world_tick(world.0);
+        }
+        let trace = world.drain_trace();
+        assert_eq!(trace["format"], trace::FORMAT);
+        let events = trace["events"].as_array().cloned().unwrap_or_default();
+        let kinds: Vec<(&str, &str)> = events
+            .iter()
+            .filter(|e| e["type"] == "sent")
+            .map(|e| {
+                (
+                    e["kind"].as_str().unwrap_or(""),
+                    e["data"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(kinds, vec![("ping", "hello"), ("pong", "hello")]);
+
+        let snap = world.snapshot();
+        assert_eq!(snap["tick"], 2);
+        assert_eq!(snap["nodes"][2]["logic"], "responder");
+        assert_eq!(snap["nodes"][1]["received"], 1);
+        assert!(
+            world.drain_trace()["events"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+    }
+
+    #[test]
+    fn send_and_logic_errors_have_their_own_codes() {
+        let world = TestWorld::new();
+        let (root, a, wifi) = (world.root(), world.node(c"a"), world.link(c"wifi"));
+        // SAFETY: live world and valid strings.
+        unsafe {
+            assert_eq!(
+                emergence_network_connect(world.0, root, a, wifi),
+                EmergenceStatus::Ok
+            );
+            assert_eq!(
+                emergence_world_set_logic(world.0, a, c"teleporter".as_ptr()),
+                EmergenceStatus::UnknownLogic
+            );
+            let send = |via: &CStr, to: &CStr| {
+                emergence_world_send(
+                    world.0,
+                    a,
+                    via.as_ptr(),
+                    to.as_ptr(),
+                    c"x".as_ptr(),
+                    ptr::null(),
+                    0,
+                )
+            };
+            assert_eq!(send(c"wifi", c"@@"), EmergenceStatus::InvalidRoute);
+            assert_eq!(send(c"cable", c"b@cable"), EmergenceStatus::NotOnLink);
+            assert_eq!(
+                emergence_world_send(
+                    world.0,
+                    a,
+                    c"wifi".as_ptr(),
+                    c"b".as_ptr(),
+                    c"x".as_ptr(),
+                    ptr::null(),
+                    3
+                ),
+                EmergenceStatus::NullPointer
+            );
+        }
+    }
+
+    #[test]
+    fn logic_kinds_are_listed() {
+        // SAFETY: returns a static NUL-terminated string.
+        let json = unsafe { CStr::from_ptr(emergence_logic_kinds_json()) };
+        let kinds: Vec<String> = serde_json::from_slice(json.to_bytes()).unwrap_or_default();
+        assert!(kinds.iter().any(|k| k == "gateway"));
     }
 }

@@ -16,6 +16,9 @@ namespace Emergence
         /// <summary>Version string of the loaded native library.</summary>
         public static unsafe string Version => FromUtf8(NativeMethods.emergence_version());
 
+        /// <summary>Names of the built-in logic kinds, as a JSON array of strings.</summary>
+        public static unsafe string LogicKindsJson => FromUtf8(NativeMethods.emergence_logic_kinds_json());
+
         private static bool _checked;
 
         /// <summary>

@@ -22,7 +22,7 @@ namespace Emergence.Native
         /// <summary>
         ///  Version of the C ABI. Bump whenever an exported signature or type layout changes.
         /// </summary>
-        internal const uint EMERGENCE_ABI_VERSION = 2;
+        internal const uint EMERGENCE_ABI_VERSION = 3;
 
 
 
@@ -211,6 +211,58 @@ namespace Emergence.Native
         [DllImport(__DllName, EntryPoint = "emergence_network_snapshot_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern EmergenceStatus emergence_network_snapshot_json(EmergenceWorld* world, byte** out_json);
 
+        /// <summary>
+        ///  Returns the names of the built-in logic kinds as a static JSON array of strings, such as
+        ///  `["responder","gateway"]`. Do not free it.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_logic_kinds_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern byte* emergence_logic_kinds_json();
+
+        /// <summary>
+        ///  Attaches a built-in logic to `node` by name (see [`emergence_logic_kinds_json`]). An empty
+        ///  string or `"none"` removes the node's logic.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `kind` must be null or
+        ///  a NUL-terminated string.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_set_logic", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_set_logic(EmergenceWorld* world, EmergenceNodeId node, byte* kind);
+
+        /// <summary>
+        ///  Queues an event from `node`, as if its own logic had sent it. It is delivered on the next
+        ///  [`emergence_world_tick`].
+        ///
+        ///  - `via_link` names the link to transmit on: one `node` subscribes to or owns.
+        ///  - `to_route` is the destination in route text form: `node@link`, or several hops joined by
+        ///    `/` such as `pc-1@wifi/fileman@ipc`. `*` addresses everyone, `^` the parent.
+        ///  - `data` may be null when `data_len` is 0.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. The strings must be
+        ///  null or NUL-terminated. `data` must be null or valid for `data_len` bytes.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_send", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_send(EmergenceWorld* world, EmergenceNodeId node, byte* via_link, byte* to_route, byte* event_kind, byte* data, System.UIntPtr data_len);
+
+        /// <summary>
+        ///  Writes a JSON description of everything that happened since the last call (packets sent,
+        ///  delivered and dropped, and notes from logic) to `out_json`, and clears it. Free the string
+        ///  with [`emergence_string_free`].
+        ///
+        ///  The format is documented in `crates/emergence-ffi/src/trace.rs` and carries its own
+        ///  `"format"` version number. The library keeps a bounded buffer; drain it regularly.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+        ///  or valid for a pointer-sized write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_drain_trace_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_drain_trace_json(EmergenceWorld* world, byte** out_json);
+
 
     }
 
@@ -296,6 +348,18 @@ namespace Emergence.Native
         ///  The node is not a child of the given parent.
         /// </summary>
         NotAChild = 10,
+        /// <summary>
+        ///  No built-in logic has that name.
+        /// </summary>
+        UnknownLogic = 11,
+        /// <summary>
+        ///  A route string could not be parsed, or a route would be too deep.
+        /// </summary>
+        InvalidRoute = 12,
+        /// <summary>
+        ///  The node is neither subscribed to the link nor its owner, so it cannot send on it.
+        /// </summary>
+        NotOnLink = 13,
         /// <summary>
         ///  The operation failed for a reason this ABI version does not have a code for.
         /// </summary>

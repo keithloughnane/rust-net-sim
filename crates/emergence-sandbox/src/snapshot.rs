@@ -10,7 +10,7 @@ use serde::Deserialize;
 use crate::native::{LinkId, NodeId};
 
 /// Snapshot format version this module understands.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct NodeEntry {
@@ -21,6 +21,9 @@ pub(crate) struct NodeEntry {
     pub(crate) children: Vec<NodeId>,
     pub(crate) internal_links: Vec<LinkId>,
     pub(crate) subscriptions: Vec<LinkId>,
+    pub(crate) logic: Option<String>,
+    pub(crate) sent: u64,
+    pub(crate) received: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,6 +37,7 @@ pub(crate) struct LinkEntry {
 #[derive(Debug, Deserialize)]
 struct Raw {
     format: u32,
+    tick: u64,
     root: NodeId,
     nodes: Vec<NodeEntry>,
     links: Vec<LinkEntry>,
@@ -64,6 +68,7 @@ impl fmt::Display for SnapshotError {
 /// A read-only copy of the whole network, with lookups by ID.
 #[derive(Debug)]
 pub(crate) struct Snapshot {
+    tick: u64,
     root: NodeId,
     nodes: Vec<NodeEntry>,
     links: Vec<LinkEntry>,
@@ -90,6 +95,7 @@ impl Snapshot {
             .map(|(i, l)| (l.id, i))
             .collect();
         let snapshot = Self {
+            tick: raw.tick,
             root: raw.root,
             nodes: raw.nodes,
             links: raw.links,
@@ -100,6 +106,17 @@ impl Snapshot {
             return Err(SnapshotError::MissingRoot);
         }
         Ok(snapshot)
+    }
+
+    pub(crate) fn tick(&self) -> u64 {
+        self.tick
+    }
+
+    /// The child of `scope` that is `node` or contains it, if `node` is below `scope`.
+    pub(crate) fn child_of_scope_containing(&self, scope: NodeId, node: NodeId) -> Option<NodeId> {
+        let path = self.path_to(node);
+        let i = path.iter().position(|&n| n == scope)?;
+        path.get(i + 1).copied()
     }
 
     pub(crate) fn root(&self) -> NodeId {
@@ -162,9 +179,9 @@ mod tests {
 
     #[test]
     fn parses_and_indexes_a_snapshot() -> Result<(), SnapshotError> {
-        let json = br#"{"format":1,"root":1,
-            "nodes":[{"id":1,"name":".","kind":"root","parent":null,"children":[2],"internal_links":[9],"subscriptions":[]},
-                     {"id":2,"name":"pc","kind":"computer","parent":1,"children":[],"internal_links":[],"subscriptions":[9]}],
+        let json = br#"{"format":2,"tick":0,"root":1,
+            "nodes":[{"id":1,"name":".","kind":"root","parent":null,"children":[2],"internal_links":[9],"subscriptions":[],"logic":null,"sent":0,"received":0},
+                     {"id":2,"name":"pc","kind":"computer","parent":1,"children":[],"internal_links":[],"subscriptions":[9],"logic":"gateway","sent":1,"received":2}],
             "links":[{"id":9,"name":"wifi","owner":1,"subscribers":[2]}]}"#;
         let snap = Snapshot::from_json(json)?;
         let pc = snap.node(snap.root()).map(|r| r.children[0]);
@@ -176,7 +193,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_format() {
-        let json = br#"{"format":99,"root":1,"nodes":[],"links":[]}"#;
+        let json = br#"{"format":99,"tick":0,"root":1,"nodes":[],"links":[]}"#;
         assert!(matches!(
             Snapshot::from_json(json),
             Err(SnapshotError::UnsupportedFormat(99))

@@ -22,6 +22,8 @@ pub(crate) struct Options {
     pub(crate) open: Option<String>,
     /// Where to save a screenshot before quitting.
     pub(crate) screenshot: Option<PathBuf>,
+    /// Simulation speed in ticks per second.
+    pub(crate) speed: Option<f32>,
 }
 
 impl Options {
@@ -30,6 +32,9 @@ impl Options {
             scenario: std::env::var("EMERGENCE_SCENARIO").ok(),
             open: std::env::var("EMERGENCE_OPEN").ok(),
             screenshot: std::env::var_os("EMERGENCE_SCREENSHOT").map(PathBuf::from),
+            speed: std::env::var("EMERGENCE_SPEED")
+                .ok()
+                .and_then(|s| s.parse().ok()),
         }
     }
 }

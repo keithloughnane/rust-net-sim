@@ -10,7 +10,7 @@
 #include <stdlib.h>
 
 // Version of the C ABI. Bump whenever an exported signature or type layout changes.
-#define EMERGENCE_ABI_VERSION 2
+#define EMERGENCE_ABI_VERSION 3
 
 // Result of a fallible call. Always 32 bits wide, whatever the host compiler does with enums.
 enum EmergenceStatus
@@ -40,6 +40,12 @@ enum EmergenceStatus
   EMERGENCE_STATUS_LINK_OWNED_ELSEWHERE = 9,
   // The node is not a child of the given parent.
   EMERGENCE_STATUS_NOT_A_CHILD = 10,
+  // No built-in logic has that name.
+  EMERGENCE_STATUS_UNKNOWN_LOGIC = 11,
+  // A route string could not be parsed, or a route would be too deep.
+  EMERGENCE_STATUS_INVALID_ROUTE = 12,
+  // The node is neither subscribed to the link nor its owner, so it cannot send on it.
+  EMERGENCE_STATUS_NOT_ON_LINK = 13,
   // The operation failed for a reason this ABI version does not have a code for.
   EMERGENCE_STATUS_FAILED = 255,
 };
@@ -219,6 +225,54 @@ EmergenceStatus emergence_network_disconnect(struct EmergenceWorld *world,
 // `world` must be null or a live handle, not in use on another thread. `out_json` must be null
 // or valid for a pointer-sized write.
 EmergenceStatus emergence_network_snapshot_json(struct EmergenceWorld *world, char **out_json);
+
+// Returns the names of the built-in logic kinds as a static JSON array of strings, such as
+// `["responder","gateway"]`. Do not free it.
+const char *emergence_logic_kinds_json(void);
+
+// Attaches a built-in logic to `node` by name (see [`emergence_logic_kinds_json`]). An empty
+// string or `"none"` removes the node's logic.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `kind` must be null or
+// a NUL-terminated string.
+EmergenceStatus emergence_world_set_logic(struct EmergenceWorld *world,
+                                          struct EmergenceNodeId node,
+                                          const char *kind);
+
+// Queues an event from `node`, as if its own logic had sent it. It is delivered on the next
+// [`emergence_world_tick`].
+//
+// - `via_link` names the link to transmit on: one `node` subscribes to or owns.
+// - `to_route` is the destination in route text form: `node@link`, or several hops joined by
+//   `/` such as `pc-1@wifi/fileman@ipc`. `*` addresses everyone, `^` the parent.
+// - `data` may be null when `data_len` is 0.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. The strings must be
+// null or NUL-terminated. `data` must be null or valid for `data_len` bytes.
+EmergenceStatus emergence_world_send(struct EmergenceWorld *world,
+                                     struct EmergenceNodeId node,
+                                     const char *via_link,
+                                     const char *to_route,
+                                     const char *event_kind,
+                                     const uint8_t *data,
+                                     size_t data_len);
+
+// Writes a JSON description of everything that happened since the last call (packets sent,
+// delivered and dropped, and notes from logic) to `out_json`, and clears it. Free the string
+// with [`emergence_string_free`].
+//
+// The format is documented in `crates/emergence-ffi/src/trace.rs` and carries its own
+// `"format"` version number. The library keeps a bounded buffer; drain it regularly.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+// or valid for a pointer-sized write.
+EmergenceStatus emergence_world_drain_trace_json(struct EmergenceWorld *world, char **out_json);
 
 #ifdef __cplusplus
 }  // extern "C"

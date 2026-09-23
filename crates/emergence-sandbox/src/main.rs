@@ -4,15 +4,18 @@
 //! the same way Unity or Unreal will. Run it with `cargo sandbox`, which builds that library
 //! first.
 
+mod activity;
 mod capture;
 mod graph_view;
 mod native;
 mod scenarios;
 mod snapshot;
 mod style;
+mod trace;
 
 use std::sync::Arc;
 
+use activity::Activity;
 use eframe::egui::{self, RichText, collapsing_header::CollapsingState};
 use graph_view::{GraphView, Item, ViewAction};
 use native::{LinkId, NativeLibrary, NativeWorld, NodeId};
@@ -39,8 +42,54 @@ fn main() -> eframe::Result {
 /// A built network: the native world that owns it and the snapshot the UI draws from.
 #[derive(Debug)]
 struct Loaded {
-    _world: NativeWorld,
+    world: NativeWorld,
     snapshot: Snapshot,
+}
+
+/// Drives `World::tick` from the UI: play/pause, single steps, and a speed.
+#[derive(Debug)]
+struct Clock {
+    playing: bool,
+    ticks_per_second: f32,
+    /// Fractional ticks owed from previous frames.
+    owed: f32,
+    step_requested: bool,
+}
+
+impl Default for Clock {
+    fn default() -> Self {
+        Self {
+            playing: true,
+            ticks_per_second: 4.0,
+            owed: 0.0,
+            step_requested: false,
+        }
+    }
+}
+
+/// The inspector's "send an event" form.
+#[derive(Debug, Default)]
+struct SendForm {
+    node: Option<NodeId>,
+    via: String,
+    to: String,
+    kind: String,
+    data: String,
+    result: Option<Result<String, String>>,
+}
+
+/// Something the inspector asked for, applied after drawing (the world is borrowed while
+/// drawing).
+#[derive(Debug)]
+enum Command {
+    SetLogic(NodeId, String),
+    Send {
+        node: NodeId,
+        via: String,
+        to: String,
+        kind: String,
+        data: String,
+    },
 }
 
 /// Where a selection came from, which decides whether the canvas or the tree follows it.
@@ -63,6 +112,12 @@ struct SandboxApp {
     tree_scope: Option<NodeId>,
     graph: GraphView,
     capture: Option<capture::Capture>,
+    clock: Clock,
+    activity: Activity,
+    log_only_selected: bool,
+    send_form: SendForm,
+    /// The last error from ticking or a command, shown in the toolbar.
+    sim_error: Option<String>,
 }
 
 impl SandboxApp {
@@ -79,7 +134,15 @@ impl SandboxApp {
             tree_scope: None,
             graph: GraphView::default(),
             capture: options.screenshot.map(capture::Capture::new),
+            clock: Clock::default(),
+            activity: Activity::default(),
+            log_only_selected: false,
+            send_form: SendForm::default(),
+            sim_error: None,
         };
+        if let Some(speed) = options.speed {
+            app.clock.ticks_per_second = speed;
+        }
         if let Some(wanted) = &options.scenario {
             app.scenario = scenarios::ALL
                 .iter()
@@ -97,16 +160,16 @@ impl SandboxApp {
     fn build(&mut self) {
         self.selection = None;
         self.graph.reset();
+        self.activity.clear();
+        self.clock.owed = 0.0;
+        self.sim_error = None;
         let Ok(library) = &self.library else { return };
         let scenario = scenarios::ALL[self.scenario];
         self.loaded = NativeWorld::new(library.clone())
             .and_then(|mut world| {
                 scenario.build(&mut world)?;
                 let snapshot = world.snapshot()?;
-                Ok(Loaded {
-                    _world: world,
-                    snapshot,
-                })
+                Ok(Loaded { world, snapshot })
             })
             .map_err(|e| format!("Building “{}” failed: {e}", scenario.name));
         self.scope = self.loaded.as_ref().ok().map(|l| l.snapshot.root());
@@ -129,7 +192,6 @@ impl SandboxApp {
         ui.horizontal(|ui| {
             ui.heading("Emergence Sandbox");
             ui.separator();
-            ui.label("Scenario");
             let before = self.scenario;
             egui::ComboBox::from_id_salt("scenario")
                 .selected_text(scenarios::ALL[self.scenario].name)
@@ -138,11 +200,42 @@ impl SandboxApp {
                         ui.selectable_value(&mut self.scenario, i, s.name)
                             .on_hover_text(s.description);
                     }
-                });
+                })
+                .response
+                .on_hover_text(scenarios::ALL[self.scenario].description);
             if ui.button("⟲ Rebuild").clicked() || before != self.scenario {
                 self.build();
             }
-            ui.weak(scenarios::ALL[self.scenario].description);
+            ui.separator();
+
+            let clock = &mut self.clock;
+            let label = if clock.playing {
+                "⏸ Pause"
+            } else {
+                "▶ Play"
+            };
+            if ui.button(label).on_hover_text("Space").clicked() {
+                clock.playing = !clock.playing;
+            }
+            if ui
+                .add_enabled(!clock.playing, egui::Button::new("Step"))
+                .on_hover_text("Run one tick")
+                .clicked()
+            {
+                clock.step_requested = true;
+            }
+            ui.add(
+                egui::Slider::new(&mut clock.ticks_per_second, 0.5..=60.0)
+                    .logarithmic(true)
+                    .suffix(" ticks/s")
+                    .max_decimals(1),
+            );
+            if let Ok(loaded) = &self.loaded {
+                ui.monospace(format!("tick {}", loaded.snapshot.tick()));
+            }
+            if let Some(e) = &self.sim_error {
+                ui.colored_label(ui.visuals().error_fg_color, e);
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Ok(library) = &self.library {
@@ -159,6 +252,82 @@ impl SandboxApp {
                 }
             });
         });
+    }
+
+    /// Runs however many ticks are due, then refreshes the snapshot and the activity view.
+    fn advance(&mut self, ctx: &egui::Context) {
+        let Ok(loaded) = &mut self.loaded else { return };
+        let clock = &mut self.clock;
+        let mut steps = u32::from(std::mem::take(&mut clock.step_requested));
+        if clock.playing {
+            clock.owed += ctx.input(|i| i.stable_dt).min(0.25) * clock.ticks_per_second;
+            let due = clock.owed.floor();
+            clock.owed -= due;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Small, positive.
+            {
+                steps += (due as u32).min(30);
+            }
+            ctx.request_repaint();
+        }
+        if steps == 0 {
+            return;
+        }
+        // Animate each batch over about one tick interval, so packets visibly hop.
+        let duration = if clock.playing {
+            (0.9 / f64::from(clock.ticks_per_second)).clamp(0.12, 1.0)
+        } else {
+            0.6
+        };
+        let result = (0..steps)
+            .try_for_each(|_| loaded.world.tick())
+            .and_then(|()| {
+                let trace = loaded.world.drain_trace()?;
+                loaded.snapshot = loaded.world.snapshot()?;
+                Ok(trace)
+            });
+        match result {
+            Ok(trace) => {
+                let now = ctx.input(|i| i.time);
+                self.activity.ingest(&loaded.snapshot, trace, now, duration);
+            }
+            Err(e) => {
+                self.sim_error = Some(e.to_string());
+                clock.playing = false;
+            }
+        }
+    }
+
+    fn run_command(&mut self, command: &Command) {
+        let Ok(loaded) = &mut self.loaded else { return };
+        let result = match command {
+            Command::SetLogic(node, kind) => loaded.world.set_logic(*node, kind),
+            Command::Send {
+                node,
+                via,
+                to,
+                kind,
+                data,
+            } => loaded.world.send(*node, via, to, kind, data.as_bytes()),
+        };
+        let result = result.and_then(|()| {
+            loaded.snapshot = loaded.world.snapshot()?;
+            Ok(())
+        });
+        if let Command::Send { to, kind, .. } = command {
+            let when = if self.clock.playing {
+                "on the next tick"
+            } else {
+                "when you step"
+            };
+            self.send_form.result = Some(
+                result
+                    .as_ref()
+                    .map(|()| format!("{kind} → {to} queued, delivered {when}"))
+                    .map_err(ToString::to_string),
+            );
+        } else if let Err(e) = result {
+            self.sim_error = Some(e.to_string());
+        }
     }
 
     fn hierarchy(&mut self, ui: &mut egui::Ui) {
@@ -194,11 +363,18 @@ impl SandboxApp {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // A flat list of panel sections.
     fn inspector(&mut self, ui: &mut egui::Ui) {
         let Ok(loaded) = &self.loaded else { return };
         let snap = &loaded.snapshot;
+        let logic_kinds: Vec<String> = self
+            .library
+            .as_ref()
+            .map(|l| l.logic_kinds().to_vec())
+            .unwrap_or_default();
         let mut clicked = None;
         let mut enter = None;
+        let mut command = None;
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| match self.selection {
@@ -228,6 +404,37 @@ impl SandboxApp {
                     });
                     if !node.children.is_empty() && ui.button("Open ⏵").clicked() {
                         enter = Some(id);
+                    }
+                    ui.add_space(8.0);
+                    ui.strong("Logic");
+                    let current = node.logic.clone().unwrap_or_else(|| "none".into());
+                    let mut chosen = current.clone();
+                    egui::ComboBox::from_id_salt("logic")
+                        .selected_text(&chosen)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut chosen, "none".into(), "none");
+                            for kind in &logic_kinds {
+                                ui.selectable_value(&mut chosen, kind.clone(), kind);
+                            }
+                        });
+                    if chosen != current {
+                        command = Some(Command::SetLogic(id, chosen));
+                    }
+                    ui.label(format!(
+                        "↑ {} sent   ↓ {} received",
+                        node.sent, node.received
+                    ));
+
+                    let usable: Vec<String> = node
+                        .subscriptions
+                        .iter()
+                        .chain(&node.internal_links)
+                        .map(|&l| snap.link_name(l).to_owned())
+                        .collect();
+                    if !usable.is_empty()
+                        && let Some(send) = send_ui(ui, &mut self.send_form, id, &usable)
+                    {
+                        command = Some(send);
                     }
                     section(ui, "Attached to", node.subscriptions.len(), |ui| {
                         for &l in &node.subscriptions {
@@ -276,6 +483,46 @@ impl SandboxApp {
         if clicked.is_some() {
             self.select(clicked, Source::Panel);
         }
+        if let Some(command) = command {
+            self.run_command(&command);
+        }
+    }
+
+    fn traffic_log(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("Traffic");
+            ui.weak(format!(
+                "{} packets · {} dropped",
+                self.activity.packets, self.activity.drops
+            ));
+            ui.checkbox(&mut self.log_only_selected, "Only the selected node");
+            if ui.button("Clear").clicked() {
+                self.activity.log.clear();
+            }
+        });
+        let only = match (self.log_only_selected, self.selection) {
+            (true, Some(Item::Node(node))) => Some(node),
+            _ => None,
+        };
+        let lines: Vec<&activity::LogLine> = self
+            .activity
+            .log
+            .iter()
+            .filter(|l| only.is_none_or(|n| l.nodes.contains(&n)))
+            .collect();
+        let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .stick_to_bottom(true)
+            .show_rows(ui, row_height, lines.len(), |ui, range| {
+                for line in &lines[range] {
+                    let text = RichText::new(format!("t{:<6}{}", line.tick, line.text))
+                        .monospace()
+                        .color(line.color);
+                    // One line per row keeps scrolling exact; hover shows the full text.
+                    ui.add(egui::Label::new(text).truncate());
+                }
+            });
     }
 
     fn breadcrumbs(&mut self, ui: &mut egui::Ui) {
@@ -330,7 +577,12 @@ impl SandboxApp {
             return;
         };
         let snap = &loaded.snapshot;
-        match self.graph.show(ui, snap, scope, self.selection) {
+        let now = ui.input(|i| i.time);
+        self.activity.expire(now);
+        match self
+            .graph
+            .show(ui, snap, scope, self.selection, &self.activity, now)
+        {
             Some(ViewAction::Select(item)) => self.select(item, Source::Canvas),
             Some(ViewAction::Enter(node)) => self.scope = Some(node),
             Some(ViewAction::Up) => {
@@ -348,6 +600,10 @@ impl eframe::App for SandboxApp {
         if let Some(capture) = &mut self.capture {
             capture.update(ctx);
         }
+        if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            self.clock.playing = !self.clock.playing;
+        }
+        self.advance(ctx);
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
             self.toolbar(ui);
@@ -383,6 +639,13 @@ impl eframe::App for SandboxApp {
                 ui.strong("Inspector");
                 ui.separator();
                 self.inspector(ui);
+            });
+        egui::TopBottomPanel::bottom("traffic")
+            .resizable(true)
+            .default_height(180.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                self.traffic_log(ui);
             });
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
@@ -508,4 +771,78 @@ fn link_button(ui: &mut egui::Ui, snap: &Snapshot, id: LinkId, clicked: &mut Opt
     if ui.link(text).clicked() {
         *clicked = Some(Item::Link(id));
     }
+}
+
+/// The inspector's send controls. Returns a command if the user sent something.
+fn send_ui(
+    ui: &mut egui::Ui,
+    form: &mut SendForm,
+    node: NodeId,
+    usable: &[String],
+) -> Option<Command> {
+    if form.node != Some(node) {
+        *form = SendForm {
+            node: Some(node),
+            via: usable[0].clone(),
+            to: format!("*@{}", usable[0]),
+            kind: "ping".into(),
+            data: "hello".into(),
+            result: None,
+        };
+    }
+    let mut command = None;
+    ui.add_space(8.0);
+    ui.strong("Send");
+    for link in usable {
+        if ui.button(format!("Ping everyone on {link}")).clicked() {
+            command = Some(Command::Send {
+                node,
+                via: link.clone(),
+                to: format!("*@{link}"),
+                kind: "ping".into(),
+                data: "sandbox".into(),
+            });
+        }
+    }
+    ui.add_space(4.0);
+    egui::Grid::new("send-form").num_columns(2).show(ui, |ui| {
+        ui.weak("Via");
+        egui::ComboBox::from_id_salt("send-via")
+            .selected_text(&form.via)
+            .show_ui(ui, |ui| {
+                for link in usable {
+                    ui.selectable_value(&mut form.via, link.clone(), link);
+                }
+            });
+        ui.end_row();
+        ui.weak("To");
+        ui.text_edit_singleline(&mut form.to)
+            .on_hover_text("node@link, several hops joined by /, * for everyone, ^ for the parent");
+        ui.end_row();
+        ui.weak("Event");
+        ui.text_edit_singleline(&mut form.kind);
+        ui.end_row();
+        ui.weak("Data");
+        ui.text_edit_singleline(&mut form.data);
+        ui.end_row();
+    });
+    if ui.button("Send").clicked() {
+        command = Some(Command::Send {
+            node,
+            via: form.via.clone(),
+            to: form.to.clone(),
+            kind: form.kind.clone(),
+            data: form.data.clone(),
+        });
+    }
+    match &form.result {
+        Some(Ok(message)) => {
+            ui.weak(message);
+        }
+        Some(Err(e)) => {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+        }
+        None => {}
+    }
+    command
 }

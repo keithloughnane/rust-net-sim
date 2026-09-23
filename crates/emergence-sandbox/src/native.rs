@@ -17,9 +17,10 @@ use libloading::Library;
 use serde::Deserialize;
 
 use crate::snapshot::{Snapshot, SnapshotError};
+use crate::trace::TraceEntry;
 
 /// ABI version this module was written against (`EMERGENCE_ABI_VERSION` in the header).
-const EXPECTED_ABI_VERSION: u32 = 2;
+const EXPECTED_ABI_VERSION: u32 = 3;
 
 /// Environment variable that overrides where the library is loaded from.
 const LIB_PATH_VAR: &str = "EMERGENCE_LIB";
@@ -81,6 +82,7 @@ pub(crate) enum NativeError {
     },
     InvalidString(NulError),
     Snapshot(SnapshotError),
+    Trace(serde_json::Error),
 }
 
 impl fmt::Display for NativeError {
@@ -96,6 +98,7 @@ impl fmt::Display for NativeError {
             Self::Status { code, message } => write!(f, "{message} (status {code})"),
             Self::InvalidString(e) => write!(f, "string contains a NUL byte: {e}"),
             Self::Snapshot(e) => write!(f, "bad network snapshot: {e}"),
+            Self::Trace(e) => write!(f, "bad trace: {e}"),
         }
     }
 }
@@ -129,12 +132,26 @@ struct Api {
     connect: unsafe extern "C" fn(*mut RawWorld, NodeId, NodeId, LinkId) -> Status,
     subscribe: unsafe extern "C" fn(*mut RawWorld, NodeId, LinkId) -> Status,
     snapshot_json: unsafe extern "C" fn(*mut RawWorld, *mut *mut c_char) -> Status,
+    world_tick: unsafe extern "C" fn(*mut RawWorld) -> Status,
+    set_logic: unsafe extern "C" fn(*mut RawWorld, NodeId, *const c_char) -> Status,
+    #[allow(clippy::type_complexity)] // Mirrors the C declaration one to one.
+    send: unsafe extern "C" fn(
+        *mut RawWorld,
+        NodeId,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        *const u8,
+        usize,
+    ) -> Status,
+    drain_trace_json: unsafe extern "C" fn(*mut RawWorld, *mut *mut c_char) -> Status,
 }
 
 /// The loaded native library and the function pointers resolved from it.
 pub(crate) struct NativeLibrary {
     path: PathBuf,
     version: String,
+    logic_kinds: Vec<String>,
     api: Api,
     // Declared last so it is dropped (unloaded) after nothing else can use the pointers above.
     _library: Library,
@@ -221,11 +238,26 @@ impl NativeLibrary {
                 snapshot_json: *library
                     .get(b"emergence_network_snapshot_json\0")
                     .map_err(load_err)?,
+                world_tick: *library.get(b"emergence_world_tick\0").map_err(load_err)?,
+                set_logic: *library
+                    .get(b"emergence_world_set_logic\0")
+                    .map_err(load_err)?,
+                send: *library.get(b"emergence_world_send\0").map_err(load_err)?,
+                drain_trace_json: *library
+                    .get(b"emergence_world_drain_trace_json\0")
+                    .map_err(load_err)?,
             };
+            let logic_kinds = *library
+                .get::<extern "C" fn() -> *const c_char>(b"emergence_logic_kinds_json\0")
+                .map_err(load_err)?;
+            let logic_kinds: Vec<String> =
+                serde_json::from_slice(CStr::from_ptr(logic_kinds()).to_bytes())
+                    .map_err(NativeError::Trace)?;
 
             Ok(Arc::new(Self {
                 path: path.to_path_buf(),
                 version,
+                logic_kinds,
                 api,
                 _library: library,
             }))
@@ -238,6 +270,11 @@ impl NativeLibrary {
 
     pub(crate) fn version(&self) -> &str {
         &self.version
+    }
+
+    /// Names of the built-in logic kinds the library offers.
+    pub(crate) fn logic_kinds(&self) -> &[String] {
+        &self.logic_kinds
     }
 
     fn check(&self, code: Status) -> Result<(), NativeError> {
@@ -335,16 +372,66 @@ impl NativeWorld {
         self.check(unsafe { (self.api().subscribe)(self.handle.as_ptr(), node, link) })
     }
 
-    pub(crate) fn snapshot(&mut self) -> Result<Snapshot, NativeError> {
-        let mut json = ptr::null_mut();
-        self.check(unsafe { (self.api().snapshot_json)(self.handle.as_ptr(), &raw mut json) })?;
+    pub(crate) fn tick(&mut self) -> Result<(), NativeError> {
+        self.check(unsafe { (self.api().world_tick)(self.handle.as_ptr()) })
+    }
+
+    pub(crate) fn set_logic(&mut self, node: NodeId, kind: &str) -> Result<(), NativeError> {
+        let kind = CString::new(kind)?;
+        self.check(unsafe { (self.api().set_logic)(self.handle.as_ptr(), node, kind.as_ptr()) })
+    }
+
+    pub(crate) fn send(
+        &mut self,
+        node: NodeId,
+        via_link: &str,
+        to_route: &str,
+        event_kind: &str,
+        data: &[u8],
+    ) -> Result<(), NativeError> {
+        let (via, to, kind) = (
+            CString::new(via_link)?,
+            CString::new(to_route)?,
+            CString::new(event_kind)?,
+        );
+        self.check(unsafe {
+            (self.api().send)(
+                self.handle.as_ptr(),
+                node,
+                via.as_ptr(),
+                to.as_ptr(),
+                kind.as_ptr(),
+                data.as_ptr(),
+                data.len(),
+            )
+        })
+    }
+
+    /// Everything that happened since the last call.
+    pub(crate) fn drain_trace(&mut self) -> Result<Vec<TraceEntry>, NativeError> {
+        let json = self.take_string(self.api().drain_trace_json)?;
+        crate::trace::parse(&json).map_err(NativeError::Trace)
+    }
+
+    /// Calls a `char **`-returning function and takes ownership of the string it returns.
+    fn take_string(
+        &mut self,
+        f: unsafe extern "C" fn(*mut RawWorld, *mut *mut c_char) -> Status,
+    ) -> Result<Vec<u8>, NativeError> {
+        let mut out = ptr::null_mut();
+        self.check(unsafe { f(self.handle.as_ptr(), &raw mut out) })?;
         // On success the library wrote an owned NUL-terminated string; free it right after.
-        let parsed = unsafe {
-            let parsed = Snapshot::from_json(CStr::from_ptr(json).to_bytes());
-            (self.api().string_free)(json);
-            parsed
+        let bytes = unsafe {
+            let bytes = CStr::from_ptr(out).to_bytes().to_vec();
+            (self.api().string_free)(out);
+            bytes
         };
-        Ok(parsed?)
+        Ok(bytes)
+    }
+
+    pub(crate) fn snapshot(&mut self) -> Result<Snapshot, NativeError> {
+        let json = self.take_string(self.api().snapshot_json)?;
+        Ok(Snapshot::from_json(&json)?)
     }
 }
 

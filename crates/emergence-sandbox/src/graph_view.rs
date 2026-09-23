@@ -12,6 +12,7 @@ use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui, Vec2, vec2,
 };
 
+use crate::activity::{Activity, GLOW_SECONDS};
 use crate::native::{LinkId, NodeId};
 use crate::snapshot::Snapshot;
 use crate::style;
@@ -303,6 +304,8 @@ impl GraphView {
         snap: &Snapshot,
         scope: NodeId,
         selection: Option<Item>,
+        activity: &Activity,
+        now: f64,
     ) -> Option<ViewAction> {
         let scene = Scene::new(snap, scope);
         let view = self.scopes.entry(scope).or_insert_with(ScopeView::new);
@@ -389,7 +392,10 @@ impl GraphView {
                 view.pan = (pointer - rect.center()) / view.zoom - anchor;
                 view.auto_fit = false;
             }
-            if ui.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Backspace))
+            if !ui.ctx().wants_keyboard_input()
+                && ui.input(|i| {
+                    i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Backspace)
+                })
             {
                 action = Some(ViewAction::Up);
             }
@@ -420,6 +426,15 @@ impl GraphView {
             };
             painter.line_segment([screen_rect(a).center(), screen_rect(b).center()], stroke);
         }
+
+        // Where each node of the network appears at this level: itself if it is a child of the
+        // scope, or the child that contains it. `None` for the scope itself and outsiders.
+        let rects: HashMap<Item, Rect> = scene.items.iter().map(|&i| (i, screen_rect(i))).collect();
+        let place = |node: NodeId| {
+            snap.child_of_scope_containing(scope, node)
+                .and_then(|c| rects.get(&Item::Node(c)).copied())
+        };
+        draw_glows(&painter, activity, now, &rects, &place, zoom);
 
         for &item in &scene.items {
             let r = screen_rect(item);
@@ -452,6 +467,11 @@ impl GraphView {
             }
         }
 
+        draw_flights(&painter, activity, now, &rects, &place, zoom);
+        if !activity.flights.is_empty() {
+            ui.ctx().request_repaint();
+        }
+
         if scene.items.is_empty() {
             painter.text(
                 rect.center(),
@@ -470,6 +490,118 @@ impl GraphView {
         );
 
         action
+    }
+}
+
+/// Halos behind links carrying a packet and nodes that just received one.
+fn draw_glows(
+    painter: &egui::Painter,
+    activity: &Activity,
+    now: f64,
+    rects: &HashMap<Item, Rect>,
+    place: &dyn Fn(NodeId) -> Option<Rect>,
+    zoom: f32,
+) {
+    let mut glow: HashMap<Rect2, (f32, Color32, f32)> = HashMap::new();
+    let mut add = |r: Rect, strength: f32, color: Color32, radius: f32| {
+        let e = glow.entry(Rect2(r)).or_insert((0.0, color, radius));
+        if strength > e.0 {
+            *e = (strength, color, radius);
+        }
+    };
+    for f in &activity.flights {
+        let color = style::event_color(&f.kind);
+        if now >= f.start
+            && now < f.arrival()
+            && let Some(&r) = rects.get(&Item::Link(f.link))
+        {
+            add(r, 0.8, color, r.height() * 0.5);
+        }
+        let since = now - f.arrival();
+        if (0.0..GLOW_SECONDS).contains(&since) {
+            #[allow(clippy::cast_possible_truncation)] // A 0..1 fraction.
+            let strength = (1.0 - since / GLOW_SECONDS) as f32;
+            for &r in &f.receivers {
+                if let Some(rect) = place(r) {
+                    add(rect, strength, color, 6.0 * zoom);
+                }
+            }
+        }
+    }
+    for (Rect2(r), (strength, color, radius)) in glow {
+        let pad = 7.0 * zoom.max(0.5);
+        painter.rect_filled(
+            r.expand(pad),
+            radius + pad,
+            color.gamma_multiply(0.18 * strength),
+        );
+        painter.rect_stroke(
+            r.expand(pad * 0.5),
+            radius + pad * 0.5,
+            Stroke::new(2.0_f32, color.gamma_multiply(strength)),
+            StrokeKind::Outside,
+        );
+    }
+}
+
+/// Dots travelling sender → link → receiver for every packet in flight.
+fn draw_flights(
+    painter: &egui::Painter,
+    activity: &Activity,
+    now: f64,
+    rects: &HashMap<Item, Rect>,
+    place: &dyn Fn(NodeId) -> Option<Rect>,
+    zoom: f32,
+) {
+    let radius = (4.5 * zoom).clamp(2.5, 7.0);
+    for f in &activity.flights {
+        if now < f.start || now >= f.arrival() {
+            continue;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let t = ((now - f.start) / f.duration) as f32;
+        let color = style::event_color(&f.kind);
+        let link = rects.get(&Item::Link(f.link)).map(Rect::center);
+        let from = place(f.sender).map(|r| r.center());
+        let draw = |start: Option<Pos2>, end: Option<Pos2>| {
+            let pos = match (start, link, end) {
+                (s, Some(l), e) => {
+                    if t < 0.5 {
+                        s.unwrap_or(l).lerp(l, t * 2.0)
+                    } else {
+                        l.lerp(e.unwrap_or(l), t * 2.0 - 1.0)
+                    }
+                }
+                // The link is not shown at this level: go straight across if both ends are.
+                (Some(s), None, Some(e)) if s != e => s.lerp(e, t),
+                _ => return,
+            };
+            painter.circle_filled(pos, radius * 2.2, color.gamma_multiply(0.25));
+            painter.circle_filled(pos, radius, color);
+        };
+        if f.receivers.is_empty() {
+            if t < 0.5 {
+                draw(from, None);
+            }
+        } else {
+            for &r in &f.receivers {
+                draw(from, place(r).map(|r| r.center()));
+            }
+        }
+    }
+}
+
+/// `Rect` as a hash key, for merging glows on the same box.
+#[derive(Clone, Copy, PartialEq)]
+struct Rect2(Rect);
+
+impl Eq for Rect2 {}
+
+impl std::hash::Hash for Rect2 {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        for v in [self.0.min.x, self.0.min.y, self.0.max.x, self.0.max.y] {
+            v.to_bits().hash(state);
+        }
     }
 }
 
@@ -598,14 +730,27 @@ fn draw_node(
     painter.text(
         Pos2::new(left, r.top() + 9.0 * scale),
         Align2::LEFT_TOP,
-        truncate(&node.name, 17),
+        truncate(&node.name, 13),
         FontId::proportional(title),
         text_color,
     );
+    let label = match &node.logic {
+        Some(logic) => format!("{} · {logic}", node.kind),
+        None => node.kind.clone(),
+    };
+    if node.sent + node.received > 0 {
+        painter.text(
+            Pos2::new(r.right() - 8.0 * scale, r.top() + 9.0 * scale),
+            Align2::RIGHT_TOP,
+            format!("↑{} ↓{}", node.sent, node.received),
+            FontId::monospace(10.0 * scale),
+            style::TEXT_WEAK,
+        );
+    }
     painter.text(
         Pos2::new(left, r.bottom() - 8.0 * scale),
         Align2::LEFT_BOTTOM,
-        &node.kind,
+        label,
         FontId::proportional(11.0 * scale),
         if dim { style::TEXT_WEAK } else { accent },
     );
@@ -613,7 +758,7 @@ fn draw_node(
         painter.text(
             Pos2::new(r.right() - 8.0 * scale, r.bottom() - 8.0 * scale),
             Align2::RIGHT_BOTTOM,
-            format!("{nested} inside ⏵"),
+            format!("{nested} ⏵"),
             FontId::proportional(11.0 * scale),
             style::TEXT_WEAK,
         );

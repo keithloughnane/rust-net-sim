@@ -35,6 +35,30 @@ internal static class Program
             Expect(json.Contains("\"name\":\"fileman\""), "snapshot contains the app");
             Expect(json.Contains("\"name\":\"wifi-1\""), "snapshot contains the link");
 
+            // Traffic: the laptop pings the app inside the PC; the PC routes it in, the app
+            // answers, and the PC routes the pong back out.
+            var laptop = world.CreateNode("laptop", "computer");
+            world.Connect(root, laptop, wifi);
+            world.SetLogic(pc, "gateway");
+            world.SetLogic(app, "responder");
+            world.DrainTraceJson();
+            world.Send(laptop, "wifi-1", "pc-1@wifi-1/fileman@ipc", "ping", new byte[] { 104, 105 });
+            for (var i = 0; i < 4; i++) world.Tick();
+            var trace = world.DrainTraceJson();
+            Expect(trace.Contains("\"kind\":\"pong\""), "the app answered the ping");
+            Expect(world.SnapshotJson().Contains("\"logic\":\"gateway\""), "snapshot shows logic");
+            Expect(EmergenceLibrary.LogicKindsJson.Contains("responder"), "logic kinds listed");
+
+            try
+            {
+                world.SetLogic(pc, "teleporter");
+                Expect(false, "unknown logic throws");
+            }
+            catch (EmergenceException e)
+            {
+                Expect(e.Status == "UnknownLogic", $"unknown logic status (got {e.Status})");
+            }
+
             try
             {
                 world.Connect(app, pc);

@@ -105,6 +105,62 @@ namespace Emergence
                 Handle, parent.ToNative(), node.ToNative()));
 
         /// <summary>
+        /// Attaches a built-in logic to <paramref name="node"/> by name (see
+        /// <see cref="EmergenceLibrary.LogicKindsJson"/>). Null, empty or "none" removes it.
+        /// </summary>
+        public void SetLogic(NodeId node, string kind)
+        {
+            var kindBytes = ToUtf8(kind ?? string.Empty, nameof(kind));
+            fixed (byte* kindPtr = kindBytes)
+            {
+                EmergenceLibrary.Check(NativeMethods.emergence_world_set_logic(Handle, node.ToNative(), kindPtr));
+            }
+        }
+
+        /// <summary>
+        /// Queues an event from <paramref name="node"/>, delivered on the next <see cref="Tick"/>.
+        /// </summary>
+        /// <param name="node">The sending node.</param>
+        /// <param name="viaLink">Name of a link the node subscribes to or owns.</param>
+        /// <param name="toRoute">Destination such as "pc-1@wifi", "*@wifi" or "pc-1@wifi/fileman@ipc".</param>
+        /// <param name="eventKind">What the event is, such as "ping".</param>
+        /// <param name="data">Optional payload.</param>
+        public void Send(NodeId node, string viaLink, string toRoute, string eventKind, byte[] data = null)
+        {
+            var via = ToUtf8(viaLink, nameof(viaLink));
+            var to = ToUtf8(toRoute, nameof(toRoute));
+            var kind = ToUtf8(eventKind, nameof(eventKind));
+            data ??= Array.Empty<byte>();
+            fixed (byte* viaPtr = via)
+            fixed (byte* toPtr = to)
+            fixed (byte* kindPtr = kind)
+            fixed (byte* dataPtr = data)
+            {
+                EmergenceLibrary.Check(NativeMethods.emergence_world_send(
+                    Handle, node.ToNative(), viaPtr, toPtr, kindPtr,
+                    data.Length == 0 ? null : dataPtr, (UIntPtr)data.Length));
+            }
+        }
+
+        /// <summary>
+        /// Returns everything that happened since the last call as JSON, and clears it (see
+        /// <c>crates/emergence-ffi/src/trace.rs</c> for the format). Call it regularly.
+        /// </summary>
+        public string DrainTraceJson()
+        {
+            byte* json;
+            EmergenceLibrary.Check(NativeMethods.emergence_world_drain_trace_json(Handle, &json));
+            try
+            {
+                return EmergenceLibrary.FromUtf8(json);
+            }
+            finally
+            {
+                NativeMethods.emergence_string_free(json);
+            }
+        }
+
+        /// <summary>
         /// Returns a JSON description of the whole network (see
         /// <c>crates/emergence-ffi/src/snapshot.rs</c> for the format).
         /// </summary>
