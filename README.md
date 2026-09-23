@@ -4,6 +4,21 @@ A hierarchical packet-routing network simulation, reimplemented in Rust from the
 design in *Smithereen Cold Boot Attack*. It ships as a native library with a C ABI, so it can be
 used from Unity (C#), Unreal (C++) or any other engine.
 
+## Concepts
+
+- **`ControlNode`**: a device, service, app or container. Nodes form a tree: each has at most one
+  parent. The tree's top is the root node (`.`), shown as "world" in the sandbox.
+- **`Link`**: a shared broadcast medium (a Wi-Fi zone, a cable, a computer's `ipc` bus). Any
+  number of nodes can subscribe to it. A link can be *internal* to one node, which is where its
+  children talk to each other. Links owned by the root are world links.
+- **`Network`**: holds every node and link, addressed by `NodeId`/`LinkId` handles. It is built
+  with `create_node`, `create_link`, `connect`, `subscribe`, `unsubscribe`, `disconnect` and
+  `add_internal_link`. Invalid operations (a second parent, a cycle, a link already owned
+  elsewhere) are rejected with a typed error and change nothing.
+- **`World`**: a network plus the simulation clock.
+
+Packets, routing and node logic are not implemented yet.
+
 ## Layout
 
 | Path | Purpose |
@@ -19,8 +34,9 @@ used from Unity (C#), Unreal (C++) or any other engine.
 ## Common commands
 
 ```sh
-cargo build                 # engine + native library (the workspace default)
-cargo test                  # engine and ABI tests
+cargo build                 # engine + native library only (the workspace default)
+cargo build --workspace     # everything, including the sandbox
+cargo test --workspace      # all tests (sandbox tests need the native library built first)
 cargo doc --open            # API docs
 
 cargo sandbox               # build the native library and run the test UI against it
@@ -32,8 +48,27 @@ cargo fmt --all             # format
 cargo check-all             # clippy on everything, warnings as errors
 ```
 
-The sandbox loads the library from next to its own executable. Set `EMERGENCE_LIB` to load a
-different build, for example one from `dist/`.
+## Sandbox
+
+`cargo sandbox` builds each test network through the C ABI, then draws it one level at a time:
+
+- **Canvas**: the children of the current node, with each link drawn as a coloured bus and a
+  spoke to each subscriber. Links owned outside the current level have a dashed outline. Nodes
+  with something inside show a stacked edge and a count; double-click to open them.
+- **Hierarchy** (left): the whole tree. Click to select and jump to that level.
+- **Inspector** (right): details of the selection, with clickable parents, children and links.
+- Scroll to zoom, drag the background to pan, drag an item to move and pin it, Esc to go up.
+
+Test networks live in `crates/emergence-sandbox/src/scenarios.rs`.
+
+Environment variables for scripted runs:
+
+| Variable | Effect |
+|---|---|
+| `EMERGENCE_LIB` | Load the library from this path instead of next to the executable. |
+| `EMERGENCE_SCENARIO` | Start with this scenario, e.g. `Mesh`. |
+| `EMERGENCE_OPEN` | Start inside the first node with this name, e.g. `pc-manager`. |
+| `EMERGENCE_SCREENSHOT` | Save a PNG of the window once the layout settles, then quit. |
 
 ## Using the library
 
@@ -48,8 +83,10 @@ different build, for example one from `dist/`.
    using Emergence;
 
    using var world = new World();
-   world.Tick();
-   Debug.Log(world.TickCount);
+   var wifi = world.CreateLink("wifi-1");
+   var pc = world.CreateNode("pc-1", "computer");
+   world.Connect(world.Root, pc, wifi);
+   Debug.Log(world.SnapshotJson());
    ```
 
 `dist` only contains the native library for the machine that built it. Other platforms need their
@@ -68,5 +105,6 @@ ThirdParty module. The header is plain C with `extern "C"` guards, so it works f
 2. If you changed or removed anything existing, bump `EMERGENCE_ABI_VERSION`.
 3. `cargo xtask bindings` and commit the regenerated files.
 4. Update the safe wrappers: `bindings/unity/Runtime/*.cs` and
-   `crates/emergence-sandbox/src/native.rs`.
-5. `cargo test && cargo xtask test-csharp && cargo check-all`.
+   `crates/emergence-sandbox/src/native.rs`. If the snapshot shape changed, bump its `FORMAT`
+   and update `crates/emergence-sandbox/src/snapshot.rs`.
+5. `cargo build --workspace && cargo test --workspace && cargo xtask test-csharp && cargo check-all`.

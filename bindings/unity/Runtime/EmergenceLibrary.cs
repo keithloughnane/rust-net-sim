@@ -14,8 +14,7 @@ namespace Emergence
         public static uint AbiVersion => NativeMethods.emergence_abi_version();
 
         /// <summary>Version string of the loaded native library.</summary>
-        public static unsafe string Version =>
-            Marshal.PtrToStringUTF8((IntPtr)NativeMethods.emergence_version()) ?? string.Empty;
+        public static unsafe string Version => FromUtf8(NativeMethods.emergence_version());
 
         private static bool _checked;
 
@@ -36,26 +35,27 @@ namespace Emergence
             _checked = true;
         }
 
-        internal static void Check(EmergenceStatus status)
+        internal static unsafe void Check(EmergenceStatus status)
         {
-            switch (status)
-            {
-                case EmergenceStatus.Ok:
-                    return;
-                case EmergenceStatus.NullPointer:
-                    throw new EmergenceException("Native call received a null pointer.");
-                case EmergenceStatus.Panic:
-                    throw new EmergenceException("Native library hit an internal error.");
-                default:
-                    throw new EmergenceException($"Native call returned unknown status {(uint)status}.");
-            }
+            if (status == EmergenceStatus.Ok) return;
+            var message = FromUtf8(NativeMethods.emergence_status_message((uint)status));
+            throw new EmergenceException(status.ToString(), message);
         }
+
+        internal static unsafe string FromUtf8(byte* utf8) =>
+            Marshal.PtrToStringUTF8((IntPtr)utf8) ?? string.Empty;
     }
 
     /// <summary>An error reported by the Emergence native library.</summary>
     public sealed class EmergenceException : Exception
     {
+        /// <summary>The native status code name, such as "UnknownNode", if the error came from a native call.</summary>
+        public string Status { get; }
+
         /// <summary>Creates an exception with the given message.</summary>
-        public EmergenceException(string message) : base(message) { }
+        public EmergenceException(string message) : base(message) => Status = string.Empty;
+
+        internal EmergenceException(string status, string message) : base($"{message} ({status})") =>
+            Status = status;
     }
 }

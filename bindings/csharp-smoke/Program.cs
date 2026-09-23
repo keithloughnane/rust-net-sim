@@ -3,6 +3,15 @@ using Emergence;
 
 internal static class Program
 {
+    private static int _failures;
+
+    private static void Expect(bool condition, string what)
+    {
+        if (condition) return;
+        Console.Error.WriteLine($"FAIL: {what}");
+        _failures++;
+    }
+
     private static int Main()
     {
         Console.WriteLine($"Emergence {EmergenceLibrary.Version} (ABI {EmergenceLibrary.AbiVersion})");
@@ -11,11 +20,29 @@ internal static class Program
         {
             world.Tick();
             world.Tick();
-            world.Tick();
-            if (world.TickCount != 3)
+            Expect(world.TickCount == 2, "tick count");
+
+            var root = world.Root;
+            var wifi = world.CreateLink("wifi-1");
+            var pc = world.CreateNode("pc-1", "computer");
+            var ipc = world.CreateLink("ipc");
+            var app = world.CreateNode("fileman", "app");
+            world.Connect(root, pc, wifi);
+            world.Connect(pc, app, ipc);
+            Expect(root.IsValid && pc != app, "IDs are valid and distinct");
+
+            var json = world.SnapshotJson();
+            Expect(json.Contains("\"name\":\"fileman\""), "snapshot contains the app");
+            Expect(json.Contains("\"name\":\"wifi-1\""), "snapshot contains the link");
+
+            try
             {
-                Console.Error.WriteLine($"FAIL: expected 3 ticks, got {world.TickCount}");
-                return 1;
+                world.Connect(app, pc);
+                Expect(false, "giving a node a second parent throws");
+            }
+            catch (EmergenceException e)
+            {
+                Expect(e.Status == "AlreadyHasParent", $"second-parent error status (got {e.Status})");
             }
         }
 
@@ -24,14 +51,13 @@ internal static class Program
         try
         {
             disposed.Tick();
-            Console.Error.WriteLine("FAIL: using a disposed world did not throw");
-            return 1;
+            Expect(false, "using a disposed world throws");
         }
         catch (ObjectDisposedException)
         {
         }
 
-        Console.WriteLine("PASS");
-        return 0;
+        Console.WriteLine(_failures == 0 ? "PASS" : $"{_failures} FAILURE(S)");
+        return _failures == 0 ? 0 : 1;
     }
 }

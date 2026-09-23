@@ -12,6 +12,7 @@ repository.workspace = true
 
 # Keep this crate free of UI/engine dependencies: it must build and ship on its own.
 [dependencies]
+slotmap = "1.1.1"
 
 [lints]
 workspace = true

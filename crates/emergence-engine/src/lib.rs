@@ -16,8 +16,12 @@
 
 #![forbid(unsafe_code)]
 
+mod ids;
+mod network;
 mod world;
 
+pub use ids::{LinkId, NodeId};
+pub use network::{ControlNode, Link, Network, NetworkError};
 pub use world::World;
 
 /// The version of this crate, as set in `Cargo.toml`.

@@ -10,7 +10,7 @@
 #include <stdlib.h>
 
 // Version of the C ABI. Bump whenever an exported signature or type layout changes.
-#define EMERGENCE_ABI_VERSION 1
+#define EMERGENCE_ABI_VERSION 2
 
 // Result of a fallible call. Always 32 bits wide, whatever the host compiler does with enums.
 enum EmergenceStatus
@@ -24,6 +24,24 @@ enum EmergenceStatus
   EMERGENCE_STATUS_NULL_POINTER = 1,
   // The library hit an internal error. The object involved should be destroyed.
   EMERGENCE_STATUS_PANIC = 2,
+  // A string argument was not valid UTF-8.
+  EMERGENCE_STATUS_INVALID_STRING = 3,
+  // A node ID does not refer to a node in this world.
+  EMERGENCE_STATUS_UNKNOWN_NODE = 4,
+  // A link ID does not refer to a link in this world.
+  EMERGENCE_STATUS_UNKNOWN_LINK = 5,
+  // The node already has a different parent. Disconnect it first.
+  EMERGENCE_STATUS_ALREADY_HAS_PARENT = 6,
+  // The operation would nest a node inside itself.
+  EMERGENCE_STATUS_WOULD_CREATE_CYCLE = 7,
+  // The root node cannot be given a parent.
+  EMERGENCE_STATUS_IS_ROOT = 8,
+  // The link is already internal to a different node.
+  EMERGENCE_STATUS_LINK_OWNED_ELSEWHERE = 9,
+  // The node is not a child of the given parent.
+  EMERGENCE_STATUS_NOT_A_CHILD = 10,
+  // The operation failed for a reason this ABI version does not have a code for.
+  EMERGENCE_STATUS_FAILED = 255,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -36,6 +54,18 @@ typedef uint32_t EmergenceStatus;
 // Opaque handle to a simulation world.
 typedef struct EmergenceWorld EmergenceWorld;
 
+// Identifies a node within a world. `raw == 0` means "no node".
+typedef struct EmergenceNodeId {
+  // Opaque value. Only compare it or pass it back; do not do arithmetic on it.
+  uint64_t raw;
+} EmergenceNodeId;
+
+// Identifies a link within a world. `raw == 0` means "no link".
+typedef struct EmergenceLinkId {
+  // Opaque value. Only compare it or pass it back; do not do arithmetic on it.
+  uint64_t raw;
+} EmergenceLinkId;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -45,6 +75,20 @@ uint32_t emergence_abi_version(void);
 
 // Returns the library version as a static, NUL-terminated UTF-8 string. Do not free it.
 const char *emergence_version(void);
+
+// Returns a short English description of an [`EmergenceStatus`] value as a static,
+// NUL-terminated string. Do not free it.
+//
+// Takes a plain integer so that any value, including codes from a newer library, is safe to
+// pass.
+const char *emergence_status_message(uint32_t status);
+
+// Frees a string returned through a `char **` out-parameter. Passing null is a no-op.
+//
+// # Safety
+//
+// `string` must be null or a string this library returned that has not already been freed.
+void emergence_string_free(char *string);
 
 // Creates a new world and writes its handle to `out_world`.
 //
@@ -78,6 +122,103 @@ EmergenceStatus emergence_world_tick(struct EmergenceWorld *world);
 // `world` must be null or a live handle from [`emergence_world_create`]. `out_count` must be
 // null or valid for a `u64` write.
 EmergenceStatus emergence_world_tick_count(const struct EmergenceWorld *world, uint64_t *out_count);
+
+// Writes the ID of the world's root node to `out_node`.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `out_node` must be null
+// or valid for a write.
+EmergenceStatus emergence_network_root(struct EmergenceWorld *world,
+                                       struct EmergenceNodeId *out_node);
+
+// Creates a detached node and writes its ID to `out_node`. Attach it with
+// [`emergence_network_connect`].
+//
+// `kind` is a free-form label such as `"computer"` or `"app"`.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `name` and `kind` must
+// be null or NUL-terminated strings. `out_node` must be null or valid for a write.
+EmergenceStatus emergence_network_create_node(struct EmergenceWorld *world,
+                                              const char *name,
+                                              const char *kind,
+                                              struct EmergenceNodeId *out_node);
+
+// Creates a link with no owner and no subscribers, and writes its ID to `out_link`.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `name` must be null or
+// a NUL-terminated string. `out_link` must be null or valid for a write.
+EmergenceStatus emergence_network_create_link(struct EmergenceWorld *world,
+                                              const char *name,
+                                              struct EmergenceLinkId *out_link);
+
+// Makes `link` internal to `owner`, so `owner`'s children can use it. Does nothing if it
+// already is.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread.
+EmergenceStatus emergence_network_add_internal_link(struct EmergenceWorld *world,
+                                                    struct EmergenceNodeId owner,
+                                                    struct EmergenceLinkId link);
+
+// Nests `node` inside `parent`. If `link.raw` is not 0, also makes `link` internal to
+// `parent` and subscribes `node` to it.
+//
+// Connecting a node to the parent it already has is allowed; that is how a child joins a
+// second internal link.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread.
+EmergenceStatus emergence_network_connect(struct EmergenceWorld *world,
+                                          struct EmergenceNodeId parent,
+                                          struct EmergenceNodeId node,
+                                          struct EmergenceLinkId link);
+
+// Attaches `node` to `link` without changing the hierarchy. Does nothing if it already is.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread.
+EmergenceStatus emergence_network_subscribe(struct EmergenceWorld *world,
+                                            struct EmergenceNodeId node,
+                                            struct EmergenceLinkId link);
+
+// Detaches `node` from `link`. Does nothing if it was not attached.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread.
+EmergenceStatus emergence_network_unsubscribe(struct EmergenceWorld *world,
+                                              struct EmergenceNodeId node,
+                                              struct EmergenceLinkId link);
+
+// Removes `node` from `parent`, the inverse of [`emergence_network_connect`]. The node also
+// leaves all of `parent`'s internal links but keeps its own children and other links.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread.
+EmergenceStatus emergence_network_disconnect(struct EmergenceWorld *world,
+                                             struct EmergenceNodeId parent,
+                                             struct EmergenceNodeId node);
+
+// Writes a JSON description of the whole network to `out_json`. Free it with
+// [`emergence_string_free`].
+//
+// The format is documented in `crates/emergence-ffi/src/snapshot.rs` and carries its own
+// `"format"` version number.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+// or valid for a pointer-sized write.
+EmergenceStatus emergence_network_snapshot_json(struct EmergenceWorld *world, char **out_json);
 
 #ifdef __cplusplus
 }  // extern "C"

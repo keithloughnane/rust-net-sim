@@ -999,12 +999,17 @@ dependencies = [
 [[package]]
 name = "emergence-engine"
 version = "0.1.0"
+dependencies = [
+ "slotmap",
+]
 
 [[package]]
 name = "emergence-ffi"
 version = "0.1.0"
 dependencies = [
  "emergence-engine",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1012,7 +1017,10 @@ name = "emergence-sandbox"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "image",
  "libloading",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

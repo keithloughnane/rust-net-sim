@@ -1,14 +1,17 @@
+use crate::Network;
+
 /// A self-contained simulation, advanced one tick at a time by its host.
 ///
 /// The host owns the clock: nothing happens between calls to [`World::tick`], which keeps the
 /// simulation deterministic and lets a debugger pause or single-step it.
 #[derive(Debug, Default)]
 pub struct World {
+    network: Network,
     tick_count: u64,
 }
 
 impl World {
-    /// Creates an empty world at tick zero.
+    /// Creates a world with an empty network, at tick zero.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -23,6 +26,17 @@ impl World {
     #[must_use]
     pub fn tick_count(&self) -> u64 {
         self.tick_count
+    }
+
+    /// The world's node/link graph.
+    #[must_use]
+    pub fn network(&self) -> &Network {
+        &self.network
+    }
+
+    /// Mutable access to the world's node/link graph, for building or changing topology.
+    pub fn network_mut(&mut self) -> &mut Network {
+        &mut self.network
     }
 }
 
