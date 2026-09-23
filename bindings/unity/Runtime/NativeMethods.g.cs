@@ -22,7 +22,7 @@ namespace Emergence.Native
         /// <summary>
         ///  Version of the C ABI. Bump whenever an exported signature or type layout changes.
         /// </summary>
-        internal const uint EMERGENCE_ABI_VERSION = 1;
+        internal const uint EMERGENCE_ABI_VERSION = 4;
 
 
 
@@ -38,6 +38,26 @@ namespace Emergence.Native
         /// </summary>
         [DllImport(__DllName, EntryPoint = "emergence_version", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern byte* emergence_version();
+
+        /// <summary>
+        ///  Returns a short English description of an [`EmergenceStatus`] value as a static,
+        ///  NUL-terminated string. Do not free it.
+        ///
+        ///  Takes a plain integer so that any value, including codes from a newer library, is safe to
+        ///  pass.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_status_message", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern byte* emergence_status_message(uint status);
+
+        /// <summary>
+        ///  Frees a string returned through a `char **` out-parameter. Passing null is a no-op.
+        ///
+        ///  # Safety
+        ///
+        ///  `string` must be null or a string this library returned that has not already been freed.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_string_free", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern void emergence_string_free(byte* @string);
 
         /// <summary>
         ///  Creates a new world and writes its handle to `out_world`.
@@ -65,6 +85,11 @@ namespace Emergence.Native
         /// <summary>
         ///  Advances the world by one tick.
         ///
+        ///  Returns [`EmergenceStatus::FuseTripped`] if the tick hit a hard limit (see
+        ///  [`emergence_world_set_limits`]). The world is still consistent; undelivered packets stay
+        ///  queued. The host decides what to do: normally pause and show
+        ///  [`emergence_world_fuse_report_json`].
+        ///
         ///  # Safety
         ///
         ///  `world` must be null or a live handle from [`emergence_world_create`], not in use on
@@ -84,6 +109,211 @@ namespace Emergence.Native
         [DllImport(__DllName, EntryPoint = "emergence_world_tick_count", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern EmergenceStatus emergence_world_tick_count(EmergenceWorld* world, ulong* out_count);
 
+        /// <summary>
+        ///  Writes the ID of the world's root node to `out_node`.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `out_node` must be null
+        ///  or valid for a write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_root", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_root(EmergenceWorld* world, EmergenceNodeId* out_node);
+
+        /// <summary>
+        ///  Creates a detached node and writes its ID to `out_node`. Attach it with
+        ///  [`emergence_network_connect`].
+        ///
+        ///  `kind` is a free-form label such as `"computer"` or `"app"`.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `name` and `kind` must
+        ///  be null or NUL-terminated strings. `out_node` must be null or valid for a write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_create_node", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_create_node(EmergenceWorld* world, byte* name, byte* kind, EmergenceNodeId* out_node);
+
+        /// <summary>
+        ///  Creates a link with no owner and no subscribers, and writes its ID to `out_link`.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `name` must be null or
+        ///  a NUL-terminated string. `out_link` must be null or valid for a write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_create_link", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_create_link(EmergenceWorld* world, byte* name, EmergenceLinkId* out_link);
+
+        /// <summary>
+        ///  Makes `link` internal to `owner`, so `owner`'s children can use it. Does nothing if it
+        ///  already is.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_add_internal_link", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_add_internal_link(EmergenceWorld* world, EmergenceNodeId owner, EmergenceLinkId link);
+
+        /// <summary>
+        ///  Nests `node` inside `parent`. If `link.raw` is not 0, also makes `link` internal to
+        ///  `parent` and subscribes `node` to it.
+        ///
+        ///  Connecting a node to the parent it already has is allowed; that is how a child joins a
+        ///  second internal link.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_connect", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_connect(EmergenceWorld* world, EmergenceNodeId parent, EmergenceNodeId node, EmergenceLinkId link);
+
+        /// <summary>
+        ///  Attaches `node` to `link` without changing the hierarchy. Does nothing if it already is.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_subscribe", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_subscribe(EmergenceWorld* world, EmergenceNodeId node, EmergenceLinkId link);
+
+        /// <summary>
+        ///  Detaches `node` from `link`. Does nothing if it was not attached.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_unsubscribe", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_unsubscribe(EmergenceWorld* world, EmergenceNodeId node, EmergenceLinkId link);
+
+        /// <summary>
+        ///  Removes `node` from `parent`, the inverse of [`emergence_network_connect`]. The node also
+        ///  leaves all of `parent`'s internal links but keeps its own children and other links.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_disconnect", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_disconnect(EmergenceWorld* world, EmergenceNodeId parent, EmergenceNodeId node);
+
+        /// <summary>
+        ///  Writes a JSON description of the whole network to `out_json`. Free it with
+        ///  [`emergence_string_free`].
+        ///
+        ///  The format is documented in `crates/emergence-ffi/src/snapshot.rs` and carries its own
+        ///  `"format"` version number.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+        ///  or valid for a pointer-sized write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_snapshot_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_snapshot_json(EmergenceWorld* world, byte** out_json);
+
+        /// <summary>
+        ///  Returns the built-in logic kinds as a static JSON array, such as
+        ///  `[{"name":"responder","faulty":false}, ...]`. Faulty kinds deliberately misbehave, for stress
+        ///  testing. Do not free the string.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_logic_kinds_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern byte* emergence_logic_kinds_json();
+
+        /// <summary>
+        ///  Sets the fuse's hard limits. 0 keeps a limit's current value.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_set_limits", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_set_limits(EmergenceWorld* world, ulong max_transmissions_per_tick, ulong max_deliveries_per_tick, ulong max_pending, ulong max_payload_bytes);
+
+        /// <summary>
+        ///  Turns recording of every packet in the trace on (non-zero, the default) or off (0). Off
+        ///  makes busy simulations much cheaper; alerts and notes are always recorded.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_set_trace_packets", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_set_trace_packets(EmergenceWorld* world, uint enabled);
+
+        /// <summary>
+        ///  Writes the world's load and safety counters as JSON to `out_json`. Free it with
+        ///  [`emergence_string_free`].
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+        ///  or valid for a pointer-sized write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_health_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_health_json(EmergenceWorld* world, byte** out_json);
+
+        /// <summary>
+        ///  Writes why the fuse tripped on the last tick as JSON to `out_json` (`null` if it did not).
+        ///  Free it with [`emergence_string_free`].
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+        ///  or valid for a pointer-sized write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_fuse_report_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_fuse_report_json(EmergenceWorld* world, byte** out_json);
+
+        /// <summary>
+        ///  Attaches a built-in logic to `node` by name (see [`emergence_logic_kinds_json`]). An empty
+        ///  string or `"none"` removes the node's logic.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `kind` must be null or
+        ///  a NUL-terminated string.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_set_logic", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_set_logic(EmergenceWorld* world, EmergenceNodeId node, byte* kind);
+
+        /// <summary>
+        ///  Queues an event from `node`, as if its own logic had sent it. It is delivered on the next
+        ///  [`emergence_world_tick`].
+        ///
+        ///  - `via_link` names the link to transmit on: one `node` subscribes to or owns.
+        ///  - `to_route` is the destination in route text form: `node@link`, or several hops joined by
+        ///    `/` such as `pc-1@wifi/fileman@ipc`. `*` addresses everyone, `^` the parent.
+        ///  - `data` may be null when `data_len` is 0.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. The strings must be
+        ///  null or NUL-terminated. `data` must be null or valid for `data_len` bytes.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_send", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_send(EmergenceWorld* world, EmergenceNodeId node, byte* via_link, byte* to_route, byte* event_kind, byte* data, System.UIntPtr data_len);
+
+        /// <summary>
+        ///  Writes a JSON description of everything that happened since the last call (packets sent,
+        ///  delivered and dropped, and notes from logic) to `out_json`, and clears it. Free the string
+        ///  with [`emergence_string_free`].
+        ///
+        ///  The format is documented in `crates/emergence-ffi/src/trace.rs` and carries its own
+        ///  `"format"` version number. The library keeps a bounded buffer; drain it regularly.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+        ///  or valid for a pointer-sized write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_drain_trace_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_drain_trace_json(EmergenceWorld* world, byte** out_json);
+
 
     }
 
@@ -93,6 +323,30 @@ namespace Emergence.Native
     [StructLayout(LayoutKind.Sequential)]
     internal unsafe partial struct EmergenceWorld
     {
+    }
+
+    /// <summary>
+    ///  Identifies a node within a world. `raw == 0` means "no node".
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal unsafe partial struct EmergenceNodeId
+    {
+        /// <summary>
+        ///  Opaque value. Only compare it or pass it back; do not do arithmetic on it.
+        /// </summary>
+        public ulong raw;
+    }
+
+    /// <summary>
+    ///  Identifies a link within a world. `raw == 0` means "no link".
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal unsafe partial struct EmergenceLinkId
+    {
+        /// <summary>
+        ///  Opaque value. Only compare it or pass it back; do not do arithmetic on it.
+        /// </summary>
+        public ulong raw;
     }
 
 
@@ -113,6 +367,76 @@ namespace Emergence.Native
         ///  The library hit an internal error. The object involved should be destroyed.
         /// </summary>
         Panic = 2,
+        /// <summary>
+        ///  A string argument was not valid UTF-8.
+        /// </summary>
+        InvalidString = 3,
+        /// <summary>
+        ///  A node ID does not refer to a node in this world.
+        /// </summary>
+        UnknownNode = 4,
+        /// <summary>
+        ///  A link ID does not refer to a link in this world.
+        /// </summary>
+        UnknownLink = 5,
+        /// <summary>
+        ///  The node already has a different parent. Disconnect it first.
+        /// </summary>
+        AlreadyHasParent = 6,
+        /// <summary>
+        ///  The operation would nest a node inside itself.
+        /// </summary>
+        WouldCreateCycle = 7,
+        /// <summary>
+        ///  The root node cannot be given a parent.
+        /// </summary>
+        IsRoot = 8,
+        /// <summary>
+        ///  The link is already internal to a different node.
+        /// </summary>
+        LinkOwnedElsewhere = 9,
+        /// <summary>
+        ///  The node is not a child of the given parent.
+        /// </summary>
+        NotAChild = 10,
+        /// <summary>
+        ///  No built-in logic has that name.
+        /// </summary>
+        UnknownLogic = 11,
+        /// <summary>
+        ///  A route string could not be parsed, or a route would be too deep.
+        /// </summary>
+        InvalidRoute = 12,
+        /// <summary>
+        ///  The node is neither subscribed to the link nor its owner, so it cannot send on it.
+        /// </summary>
+        NotOnLink = 13,
+        /// <summary>
+        ///  A node or link name is empty, too long, reserved, or contains route syntax (`@`, `/`).
+        /// </summary>
+        InvalidName = 14,
+        /// <summary>
+        ///  Another node on the same link already has that name, or the node already uses another
+        ///  link with that name.
+        /// </summary>
+        NameConflict = 15,
+        /// <summary>
+        ///  The send queue is full; the world is overloaded. Nothing was sent.
+        /// </summary>
+        QueueFull = 16,
+        /// <summary>
+        ///  The event payload or kind is larger than the limits allow.
+        /// </summary>
+        PayloadTooLarge = 17,
+        /// <summary>
+        ///  Not an error: the tick ran, but hit a hard limit and held packets back. The network is
+        ///  running away. Pause and read [`emergence_world_fuse_report_json`].
+        /// </summary>
+        FuseTripped = 18,
+        /// <summary>
+        ///  The operation failed for a reason this ABI version does not have a code for.
+        /// </summary>
+        Failed = 255,
     }
 
 

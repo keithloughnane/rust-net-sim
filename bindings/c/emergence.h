@@ -10,7 +10,7 @@
 #include <stdlib.h>
 
 // Version of the C ABI. Bump whenever an exported signature or type layout changes.
-#define EMERGENCE_ABI_VERSION 1
+#define EMERGENCE_ABI_VERSION 4
 
 // Result of a fallible call. Always 32 bits wide, whatever the host compiler does with enums.
 enum EmergenceStatus
@@ -24,6 +24,42 @@ enum EmergenceStatus
   EMERGENCE_STATUS_NULL_POINTER = 1,
   // The library hit an internal error. The object involved should be destroyed.
   EMERGENCE_STATUS_PANIC = 2,
+  // A string argument was not valid UTF-8.
+  EMERGENCE_STATUS_INVALID_STRING = 3,
+  // A node ID does not refer to a node in this world.
+  EMERGENCE_STATUS_UNKNOWN_NODE = 4,
+  // A link ID does not refer to a link in this world.
+  EMERGENCE_STATUS_UNKNOWN_LINK = 5,
+  // The node already has a different parent. Disconnect it first.
+  EMERGENCE_STATUS_ALREADY_HAS_PARENT = 6,
+  // The operation would nest a node inside itself.
+  EMERGENCE_STATUS_WOULD_CREATE_CYCLE = 7,
+  // The root node cannot be given a parent.
+  EMERGENCE_STATUS_IS_ROOT = 8,
+  // The link is already internal to a different node.
+  EMERGENCE_STATUS_LINK_OWNED_ELSEWHERE = 9,
+  // The node is not a child of the given parent.
+  EMERGENCE_STATUS_NOT_A_CHILD = 10,
+  // No built-in logic has that name.
+  EMERGENCE_STATUS_UNKNOWN_LOGIC = 11,
+  // A route string could not be parsed, or a route would be too deep.
+  EMERGENCE_STATUS_INVALID_ROUTE = 12,
+  // The node is neither subscribed to the link nor its owner, so it cannot send on it.
+  EMERGENCE_STATUS_NOT_ON_LINK = 13,
+  // A node or link name is empty, too long, reserved, or contains route syntax (`@`, `/`).
+  EMERGENCE_STATUS_INVALID_NAME = 14,
+  // Another node on the same link already has that name, or the node already uses another
+  // link with that name.
+  EMERGENCE_STATUS_NAME_CONFLICT = 15,
+  // The send queue is full; the world is overloaded. Nothing was sent.
+  EMERGENCE_STATUS_QUEUE_FULL = 16,
+  // The event payload or kind is larger than the limits allow.
+  EMERGENCE_STATUS_PAYLOAD_TOO_LARGE = 17,
+  // Not an error: the tick ran, but hit a hard limit and held packets back. The network is
+  // running away. Pause and read [`emergence_world_fuse_report_json`].
+  EMERGENCE_STATUS_FUSE_TRIPPED = 18,
+  // The operation failed for a reason this ABI version does not have a code for.
+  EMERGENCE_STATUS_FAILED = 255,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -36,6 +72,18 @@ typedef uint32_t EmergenceStatus;
 // Opaque handle to a simulation world.
 typedef struct EmergenceWorld EmergenceWorld;
 
+// Identifies a node within a world. `raw == 0` means "no node".
+typedef struct EmergenceNodeId {
+  // Opaque value. Only compare it or pass it back; do not do arithmetic on it.
+  uint64_t raw;
+} EmergenceNodeId;
+
+// Identifies a link within a world. `raw == 0` means "no link".
+typedef struct EmergenceLinkId {
+  // Opaque value. Only compare it or pass it back; do not do arithmetic on it.
+  uint64_t raw;
+} EmergenceLinkId;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -45,6 +93,20 @@ uint32_t emergence_abi_version(void);
 
 // Returns the library version as a static, NUL-terminated UTF-8 string. Do not free it.
 const char *emergence_version(void);
+
+// Returns a short English description of an [`EmergenceStatus`] value as a static,
+// NUL-terminated string. Do not free it.
+//
+// Takes a plain integer so that any value, including codes from a newer library, is safe to
+// pass.
+const char *emergence_status_message(uint32_t status);
+
+// Frees a string returned through a `char **` out-parameter. Passing null is a no-op.
+//
+// # Safety
+//
+// `string` must be null or a string this library returned that has not already been freed.
+void emergence_string_free(char *string);
 
 // Creates a new world and writes its handle to `out_world`.
 //
@@ -65,6 +127,11 @@ void emergence_world_destroy(struct EmergenceWorld *world);
 
 // Advances the world by one tick.
 //
+// Returns [`EmergenceStatus::FuseTripped`] if the tick hit a hard limit (see
+// [`emergence_world_set_limits`]). The world is still consistent; undelivered packets stay
+// queued. The host decides what to do: normally pause and show
+// [`emergence_world_fuse_report_json`].
+//
 // # Safety
 //
 // `world` must be null or a live handle from [`emergence_world_create`], not in use on
@@ -78,6 +145,189 @@ EmergenceStatus emergence_world_tick(struct EmergenceWorld *world);
 // `world` must be null or a live handle from [`emergence_world_create`]. `out_count` must be
 // null or valid for a `u64` write.
 EmergenceStatus emergence_world_tick_count(const struct EmergenceWorld *world, uint64_t *out_count);
+
+// Writes the ID of the world's root node to `out_node`.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `out_node` must be null
+// or valid for a write.
+EmergenceStatus emergence_network_root(struct EmergenceWorld *world,
+                                       struct EmergenceNodeId *out_node);
+
+// Creates a detached node and writes its ID to `out_node`. Attach it with
+// [`emergence_network_connect`].
+//
+// `kind` is a free-form label such as `"computer"` or `"app"`.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `name` and `kind` must
+// be null or NUL-terminated strings. `out_node` must be null or valid for a write.
+EmergenceStatus emergence_network_create_node(struct EmergenceWorld *world,
+                                              const char *name,
+                                              const char *kind,
+                                              struct EmergenceNodeId *out_node);
+
+// Creates a link with no owner and no subscribers, and writes its ID to `out_link`.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `name` must be null or
+// a NUL-terminated string. `out_link` must be null or valid for a write.
+EmergenceStatus emergence_network_create_link(struct EmergenceWorld *world,
+                                              const char *name,
+                                              struct EmergenceLinkId *out_link);
+
+// Makes `link` internal to `owner`, so `owner`'s children can use it. Does nothing if it
+// already is.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread.
+EmergenceStatus emergence_network_add_internal_link(struct EmergenceWorld *world,
+                                                    struct EmergenceNodeId owner,
+                                                    struct EmergenceLinkId link);
+
+// Nests `node` inside `parent`. If `link.raw` is not 0, also makes `link` internal to
+// `parent` and subscribes `node` to it.
+//
+// Connecting a node to the parent it already has is allowed; that is how a child joins a
+// second internal link.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread.
+EmergenceStatus emergence_network_connect(struct EmergenceWorld *world,
+                                          struct EmergenceNodeId parent,
+                                          struct EmergenceNodeId node,
+                                          struct EmergenceLinkId link);
+
+// Attaches `node` to `link` without changing the hierarchy. Does nothing if it already is.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread.
+EmergenceStatus emergence_network_subscribe(struct EmergenceWorld *world,
+                                            struct EmergenceNodeId node,
+                                            struct EmergenceLinkId link);
+
+// Detaches `node` from `link`. Does nothing if it was not attached.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread.
+EmergenceStatus emergence_network_unsubscribe(struct EmergenceWorld *world,
+                                              struct EmergenceNodeId node,
+                                              struct EmergenceLinkId link);
+
+// Removes `node` from `parent`, the inverse of [`emergence_network_connect`]. The node also
+// leaves all of `parent`'s internal links but keeps its own children and other links.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread.
+EmergenceStatus emergence_network_disconnect(struct EmergenceWorld *world,
+                                             struct EmergenceNodeId parent,
+                                             struct EmergenceNodeId node);
+
+// Writes a JSON description of the whole network to `out_json`. Free it with
+// [`emergence_string_free`].
+//
+// The format is documented in `crates/emergence-ffi/src/snapshot.rs` and carries its own
+// `"format"` version number.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+// or valid for a pointer-sized write.
+EmergenceStatus emergence_network_snapshot_json(struct EmergenceWorld *world, char **out_json);
+
+// Returns the built-in logic kinds as a static JSON array, such as
+// `[{"name":"responder","faulty":false}, ...]`. Faulty kinds deliberately misbehave, for stress
+// testing. Do not free the string.
+const char *emergence_logic_kinds_json(void);
+
+// Sets the fuse's hard limits. 0 keeps a limit's current value.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread.
+EmergenceStatus emergence_world_set_limits(struct EmergenceWorld *world,
+                                           uint64_t max_transmissions_per_tick,
+                                           uint64_t max_deliveries_per_tick,
+                                           uint64_t max_pending,
+                                           uint64_t max_payload_bytes);
+
+// Turns recording of every packet in the trace on (non-zero, the default) or off (0). Off
+// makes busy simulations much cheaper; alerts and notes are always recorded.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread.
+EmergenceStatus emergence_world_set_trace_packets(struct EmergenceWorld *world, uint32_t enabled);
+
+// Writes the world's load and safety counters as JSON to `out_json`. Free it with
+// [`emergence_string_free`].
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+// or valid for a pointer-sized write.
+EmergenceStatus emergence_world_health_json(struct EmergenceWorld *world, char **out_json);
+
+// Writes why the fuse tripped on the last tick as JSON to `out_json` (`null` if it did not).
+// Free it with [`emergence_string_free`].
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+// or valid for a pointer-sized write.
+EmergenceStatus emergence_world_fuse_report_json(struct EmergenceWorld *world, char **out_json);
+
+// Attaches a built-in logic to `node` by name (see [`emergence_logic_kinds_json`]). An empty
+// string or `"none"` removes the node's logic.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `kind` must be null or
+// a NUL-terminated string.
+EmergenceStatus emergence_world_set_logic(struct EmergenceWorld *world,
+                                          struct EmergenceNodeId node,
+                                          const char *kind);
+
+// Queues an event from `node`, as if its own logic had sent it. It is delivered on the next
+// [`emergence_world_tick`].
+//
+// - `via_link` names the link to transmit on: one `node` subscribes to or owns.
+// - `to_route` is the destination in route text form: `node@link`, or several hops joined by
+//   `/` such as `pc-1@wifi/fileman@ipc`. `*` addresses everyone, `^` the parent.
+// - `data` may be null when `data_len` is 0.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. The strings must be
+// null or NUL-terminated. `data` must be null or valid for `data_len` bytes.
+EmergenceStatus emergence_world_send(struct EmergenceWorld *world,
+                                     struct EmergenceNodeId node,
+                                     const char *via_link,
+                                     const char *to_route,
+                                     const char *event_kind,
+                                     const uint8_t *data,
+                                     size_t data_len);
+
+// Writes a JSON description of everything that happened since the last call (packets sent,
+// delivered and dropped, and notes from logic) to `out_json`, and clears it. Free the string
+// with [`emergence_string_free`].
+//
+// The format is documented in `crates/emergence-ffi/src/trace.rs` and carries its own
+// `"format"` version number. The library keeps a bounded buffer; drain it regularly.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+// or valid for a pointer-sized write.
+EmergenceStatus emergence_world_drain_trace_json(struct EmergenceWorld *world, char **out_json);
 
 #ifdef __cplusplus
 }  // extern "C"
