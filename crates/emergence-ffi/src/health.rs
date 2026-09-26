@@ -19,6 +19,9 @@ pub(crate) struct HealthJson {
     fuse_trips: u64,
     trace_len: usize,
     trace_discarded: u64,
+    host_pending: usize,
+    host_discarded: u64,
+    direct_pushes: u64,
     limits: LimitsJson,
 }
 
@@ -45,6 +48,9 @@ pub(crate) fn health(world: &World) -> HealthJson {
         fuse_trips,
         trace_len,
         trace_discarded,
+        host_pending,
+        host_discarded,
+        direct_pushes,
         ..
     } = world.health();
     let limits = world.limits();
@@ -61,6 +67,9 @@ pub(crate) fn health(world: &World) -> HealthJson {
         fuse_trips,
         trace_len,
         trace_discarded,
+        host_pending,
+        host_discarded,
+        direct_pushes,
         limits: LimitsJson {
             max_transmissions_per_tick: limits.max_transmissions_per_tick,
             max_deliveries_per_tick: limits.max_deliveries_per_tick,

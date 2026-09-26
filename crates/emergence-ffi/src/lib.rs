@@ -22,6 +22,7 @@
 #![allow(unsafe_code)] // Exporting a C ABI is unsafe by nature; keep it confined to this crate.
 
 mod health;
+mod host;
 mod snapshot;
 mod trace;
 
@@ -30,12 +31,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 
 use emergence_engine::{
-    ControlNode, Event, FAULTY_LOGIC_KINDS, LOGIC_KINDS, Limits, Link, LinkId, LogicError,
-    NetworkError, NodeId, PacketRoute, SendError, TickOutcome, World,
+    ControlNode, Event, FAULTY_LOGIC_KINDS, Hop, LOGIC_KINDS, Limits, Link, LinkId, LogicError,
+    NetworkError, NodeId, Packet, PacketRoute, SendError, TickOutcome, World,
 };
 
 /// Version of the C ABI. Bump whenever an exported signature or type layout changes.
-pub const EMERGENCE_ABI_VERSION: u32 = 5;
+pub const EMERGENCE_ABI_VERSION: u32 = 8;
 
 static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 
@@ -1141,6 +1142,201 @@ pub unsafe extern "C" fn emergence_world_send(
     }
 }
 
+/// Makes `node` a host node (`host` true) or an ordinary node again (`host` false).
+///
+/// A host node's behaviour lives in the host: every packet on its links is handed over, whatever
+/// the accept rules would say, to be collected with [`emergence_world_drain_host_deliveries_json`]
+/// after each tick. It sends with [`emergence_world_host_send`]. Making a node a host node removes
+/// its logic.
+///
+/// # Safety
+///
+/// `world` must be null or a live handle, not in use on another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emergence_world_set_host(
+    world: *mut EmergenceWorld,
+    node: EmergenceNodeId,
+    host: bool,
+) -> EmergenceStatus {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { with_world(world, |world| world.set_host(node.into(), host).into()) }
+}
+
+/// Queues a packet from `node` on `link` with every field chosen by the host: how a host node
+/// sends, replies and forwards. It is delivered on the next [`emergence_world_tick`].
+///
+/// - `from_route` and `to_route` are JSON arrays of `[node, link]` pairs, head first, such as
+///   `[["pc-1","wifi"],["fileman","ipc"]]`. Hop names are taken as they are (they are addresses,
+///   not the names of nodes in this world), so any text is allowed.
+/// - `ttl` is the hop budget left, for loop protection; each delivery uses one, and the last is
+///   never delivered. 0 means a fresh packet, which starts with the library's default budget.
+///   Pass on a delivered packet's `ttl` when forwarding it, so loops still run out.
+/// - `data` may be null when `data_len` is 0.
+///
+/// # Safety
+///
+/// `world` must be null or a live handle, not in use on another thread. The strings must be
+/// null or NUL-terminated. `data` must be null or valid for `data_len` bytes.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)] // One argument per packet field is the clearest C shape.
+pub unsafe extern "C" fn emergence_world_host_send(
+    world: *mut EmergenceWorld,
+    node: EmergenceNodeId,
+    link: EmergenceLinkId,
+    from_route: *const c_char,
+    to_route: *const c_char,
+    event_kind: *const c_char,
+    data: *const u8,
+    data_len: usize,
+    ttl: u8,
+) -> EmergenceStatus {
+    if data.is_null() && data_len != 0 {
+        return EmergenceStatus::NullPointer;
+    }
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        with_world(world, |world| {
+            let (from, to, kind) = match (
+                borrow_str(from_route),
+                borrow_str(to_route),
+                borrow_str(event_kind),
+            ) {
+                (Ok(f), Ok(t), Ok(k)) => (f, t, k),
+                (Err(s), _, _) | (_, Err(s), _) | (_, _, Err(s)) => return s,
+            };
+            let (Some(from), Some(to)) = (route_from_json(from), route_from_json(to)) else {
+                return EmergenceStatus::InvalidRoute;
+            };
+            let bytes = if data_len == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(data, data_len).to_vec()
+            };
+            world
+                .send_packet(
+                    node.into(),
+                    link.into(),
+                    from,
+                    to,
+                    Event::with_data(kind, bytes),
+                    budget(ttl),
+                )
+                .into()
+        })
+    }
+}
+
+/// Hands a packet straight to host node `node` now: no link, no queue, no tick. For a host that
+/// must deliver something immediately. It still counts as traffic: it spends a hop of `ttl`, is
+/// counted (`direct_pushes` in [`emergence_world_health_json`]), traced as `"pushed"` and seen by
+/// the monitor. The host delivers the packet itself; `out_ttl` receives the hop budget left, or 0
+/// if it ran out and the packet was dropped. As for [`emergence_world_host_send`], a `ttl` of 0
+/// means a fresh packet.
+///
+/// Routes are JSON arrays of `[node, link]` pairs, as for [`emergence_world_host_send`].
+///
+/// # Safety
+///
+/// `world` must be null or a live handle, not in use on another thread. The strings must be
+/// null or NUL-terminated. `data` must be null or valid for `data_len` bytes. `out_ttl` must be
+/// null or valid for a one-byte write.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)] // One argument per packet field is the clearest C shape.
+pub unsafe extern "C" fn emergence_world_host_push(
+    world: *mut EmergenceWorld,
+    node: EmergenceNodeId,
+    from_route: *const c_char,
+    to_route: *const c_char,
+    event_kind: *const c_char,
+    data: *const u8,
+    data_len: usize,
+    ttl: u8,
+    out_ttl: *mut u8,
+) -> EmergenceStatus {
+    if out_ttl.is_null() || (data.is_null() && data_len != 0) {
+        return EmergenceStatus::NullPointer;
+    }
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        with_world(world, |world| {
+            let (from, to, kind) = match (
+                borrow_str(from_route),
+                borrow_str(to_route),
+                borrow_str(event_kind),
+            ) {
+                (Ok(f), Ok(t), Ok(k)) => (f, t, k),
+                (Err(s), _, _) | (_, Err(s), _) | (_, _, Err(s)) => return s,
+            };
+            let (Some(from), Some(to)) = (route_from_json(from), route_from_json(to)) else {
+                return EmergenceStatus::InvalidRoute;
+            };
+            let bytes = if data_len == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(data, data_len).to_vec()
+            };
+            match world.push_direct(
+                node.into(),
+                from,
+                to,
+                Event::with_data(kind, bytes),
+                budget(ttl),
+            ) {
+                Ok(pushed) => {
+                    out_ttl.write(pushed.map_or(0, |p| p.ttl()));
+                    EmergenceStatus::Ok
+                }
+                Err(e) => e.into(),
+            }
+        })
+    }
+}
+
+/// The hop budget a host asked for: 0 means a fresh packet's.
+fn budget(ttl: u8) -> u8 {
+    if ttl == 0 { Packet::DEFAULT_TTL } else { ttl }
+}
+
+/// A route from its JSON form, `[[node, link], ...]`.
+fn route_from_json(json: &str) -> Option<PacketRoute> {
+    let pairs: Vec<(String, String)> = serde_json::from_str(json).ok()?;
+    PacketRoute::from_hops(
+        pairs
+            .into_iter()
+            .map(|(node, link)| Hop::new(node, link))
+            .collect(),
+    )
+    .ok()
+}
+
+/// Writes everything delivered to host nodes since the last call to `out_json`, in delivery
+/// order, and clears it. Free the string with [`emergence_string_free`].
+///
+/// The format is `{"deliveries":[{"receiver":n,"link":n,"from":[[node,link],...],"to":[...],
+/// "kind":"...","data":"hex","ttl":n},...]}`, where `receiver` and `link` are raw handle values
+/// and `data` is the payload as lowercase hex.
+///
+/// # Safety
+///
+/// `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+/// or valid for a pointer-sized write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emergence_world_drain_host_deliveries_json(
+    world: *mut EmergenceWorld,
+    out_json: *mut *mut c_char,
+) -> EmergenceStatus {
+    if out_json.is_null() {
+        return EmergenceStatus::NullPointer;
+    }
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        with_world(world, |world| {
+            let deliveries = world.drain_host_deliveries();
+            write_json(&host::Deliveries::of(&deliveries), out_json)
+        })
+    }
+}
+
 /// Writes a JSON description of everything that happened since the last call (packets sent,
 /// delivered and dropped, and notes from logic) to `out_json`, and clears it. Free the string
 /// with [`emergence_string_free`].
@@ -1255,6 +1451,109 @@ mod tests {
         fn drop(&mut self) {
             // SAFETY: created in `new`, destroyed exactly once.
             unsafe { emergence_world_destroy(self.0) };
+        }
+    }
+
+    #[test]
+    fn host_nodes_send_and_collect_through_the_abi() {
+        let world = TestWorld::new();
+        let wifi = world.link(c"wifi");
+        let (a, b) = (world.node(c"a"), world.node(c"b"));
+        let root = world.root();
+        let mut json = ptr::null_mut();
+        // SAFETY: live world and handles, NUL-terminated strings, valid out-pointers; the JSON
+        // string is freed below.
+        unsafe {
+            for n in [a, b] {
+                assert_eq!(
+                    emergence_network_connect(world.0, root, n, wifi),
+                    EmergenceStatus::Ok
+                );
+                assert_eq!(
+                    emergence_world_set_host(world.0, n, true),
+                    EmergenceStatus::Ok
+                );
+            }
+            let data = [0xAB_u8, 0x01];
+            let send = |from: &CStr, to: &CStr| {
+                emergence_world_host_send(
+                    world.0,
+                    a,
+                    wifi,
+                    from.as_ptr(),
+                    to.as_ptr(),
+                    c"Hello".as_ptr(),
+                    data.as_ptr(),
+                    data.len(),
+                    7,
+                )
+            };
+            assert_eq!(
+                send(
+                    c"[[\"a\",\"?\"]]",
+                    c"[[\"b\",\"wifi\"],[\"app/1@x\",\"ipc\"]]"
+                ),
+                EmergenceStatus::Ok
+            );
+            assert_eq!(
+                send(c"[]", c"[[\"b\",\"wifi\"]]"),
+                EmergenceStatus::InvalidRoute
+            );
+            assert_eq!(send(c"nonsense", c"[]"), EmergenceStatus::InvalidRoute);
+            assert_eq!(emergence_world_tick(world.0), EmergenceStatus::Ok);
+            assert_eq!(
+                emergence_world_drain_host_deliveries_json(world.0, &raw mut json),
+                EmergenceStatus::Ok
+            );
+            let value: serde_json::Value =
+                serde_json::from_slice(CStr::from_ptr(json).to_bytes()).unwrap_or_default();
+            emergence_string_free(json);
+            let delivery = &value["deliveries"][0];
+            assert_eq!(delivery["receiver"], b.raw);
+            assert_eq!(delivery["link"], wifi.raw);
+            assert_eq!(
+                delivery["to"][1][0], "app/1@x",
+                "hop names are kept as they are"
+            );
+            assert_eq!(delivery["from"][0][1], "?");
+            assert_eq!(delivery["kind"], "Hello");
+            assert_eq!(delivery["data"], "ab01");
+            assert_eq!(delivery["ttl"], 6);
+            assert_eq!(value["deliveries"].as_array().map(Vec::len), Some(1));
+        }
+    }
+
+    #[test]
+    fn direct_pushes_through_the_abi() {
+        let world = TestWorld::new();
+        let device = world.node(c"device");
+        let mut ttl = 99_u8;
+        // SAFETY: live world and handle, NUL-terminated strings, valid out-pointer.
+        unsafe {
+            assert_eq!(
+                emergence_world_set_host(world.0, device, true),
+                EmergenceStatus::Ok
+            );
+            let push = |ttl_in: u8, out: *mut u8| {
+                emergence_world_host_push(
+                    world.0,
+                    device,
+                    c"[[\"player\",\"tool-use\"]]".as_ptr(),
+                    c"[[\"device\",\"tool-use\"]]".as_ptr(),
+                    c"ToolUseSignal".as_ptr(),
+                    ptr::null(),
+                    0,
+                    ttl_in,
+                    out,
+                )
+            };
+            assert_eq!(push(16, &raw mut ttl), EmergenceStatus::Ok);
+            assert_eq!(ttl, 15);
+            assert_eq!(push(0, &raw mut ttl), EmergenceStatus::Ok);
+            assert_eq!(ttl, 15, "0 means a fresh packet");
+            assert_eq!(push(1, &raw mut ttl), EmergenceStatus::Ok);
+            assert_eq!(ttl, 0, "the last hop is dropped");
+            assert_eq!(push(16, ptr::null_mut()), EmergenceStatus::NullPointer);
         }
     }
 

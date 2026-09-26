@@ -27,6 +27,20 @@ used from Unity (C#), Unreal (C++) or any other engine.
   every `on_tick`, then delivers everything queued before it. Replies wait for the next tick, so
   packets move one hop per tick, the same inputs always give the same result, and a tick
   always finishes. `drain_trace()` reports what happened (sent, delivered, dropped, notes).
+- **Host nodes**: nodes whose behaviour lives in the host (a game's own C# logic, say) instead of a
+  `ControllerLogic`. `set_host(node, true)` hands every packet on the node's links to the host,
+  whatever the accept rules say; the host collects them after each tick with
+  `drain_host_deliveries()` and applies its own rules. It sends with `send_packet`, choosing the
+  routes and event itself, so it can reply and forward. TTL is the library's loop protection: a
+  host sends fresh packets without one (0 over the C ABI, `null` in C#) and passes a delivered
+  packet's TTL on when it forwards it, so loops through host nodes still run out. Over the C ABI:
+  `emergence_world_set_host`, `emergence_world_host_send` and
+  `emergence_world_drain_host_deliveries_json`; in C#: `World.SetHost`, `World.HostSend` and
+  `World.DrainHostDeliveries`. This is how a game keeps its own behaviour while Emergence carries
+  the traffic: topology, links, ticking, TTL, the monitor and the fuse. When the host must deliver
+  something immediately, `push_direct` (`emergence_world_host_push`, `World.HostPush`) hands a
+  packet straight to a node with no link or tick; it still spends a hop, is counted
+  (`direct_pushes` in the health report), traced as `pushed` and watched by the monitor.
 
 ### Results at the boundary
 
@@ -147,7 +161,7 @@ cargo doc --open            # API docs
 cargo sandbox               # build the native library and run the test UI against it
 cargo xtask bindings        # regenerate the C header and C# bindings after changing the ABI
 cargo xtask test-csharp     # run the C# bindings against the native library (needs dotnet)
-cargo xtask dist            # package a release build into dist/
+cargo xtask dist            # package release builds for every platform into dist/ (--host: this one only)
 
 cargo fmt --all             # format
 cargo check-all             # clippy on everything, warnings as errors
@@ -267,9 +281,28 @@ Environment variables for scripted runs:
    Debug.Log(world.DrainTraceJson());
    ```
 
-`dist` only contains the native library for the machine that built it. Other platforms need their
-own build (or cross-compilation) added to `Runtime/Plugins/`. On iOS the bindings automatically
-switch to the statically linked `__Internal` library.
+`dist` builds the native library for every desktop platform, each in its own folder under
+`Runtime/Plugins/` with a `.meta` that makes it a native plugin for its own editor and player only:
+
+| Folder | Library | Built for |
+|---|---|---|
+| `macos` | `libemergence.dylib` | macOS, universal (Apple silicon and Intel) |
+| `linux-x86_64` | `libemergence.so` | Linux x86-64, glibc 2.17 or newer |
+| `windows-x86_64` | `emergence.dll` | Windows x86-64 (only needs the Universal C Runtime of Windows 10+) |
+
+Linux and Windows are cross-compiled with [zig](https://ziglang.org):
+
+```sh
+brew install zig
+cargo install cargo-zigbuild
+rustup target add x86_64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-gnu
+```
+
+`cargo xtask dist --host` skips cross-compiling and packages only the machine you are on. The
+`.meta` GUIDs are fixed, so copying a new `dist` over a project's copy of the package keeps its
+references. Unity never reloads a native library while it runs: restart the editor after
+replacing one. On iOS the bindings automatically switch to the statically linked `__Internal`
+library.
 
 ### Unreal / C++
 

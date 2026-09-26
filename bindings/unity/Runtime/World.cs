@@ -18,7 +18,7 @@ namespace Emergence
     /// is only a safety net.
     /// </summary>
     /// <remarks>Not thread-safe: use each world from one thread at a time.</remarks>
-    public sealed unsafe class World : IDisposable
+    public sealed unsafe partial class World : IDisposable
     {
         private EmergenceWorld* _handle;
 

@@ -61,6 +61,38 @@ internal static class Program
             Expect(world.SnapshotJson().Contains("\"logic\":\"gateway\""), "snapshot shows logic");
             Expect(EmergenceLibrary.LogicKindsJson.Contains("responder"), "logic kinds listed");
 
+            // Host nodes: the game runs the behaviour and Emergence carries the packets.
+            var hostLink = world.CreateLink("host-bus");
+            var hostA = world.CreateNode("host-a", "device");
+            var hostB = world.CreateNode("host-b", "device");
+            world.Connect(root, hostA, hostLink);
+            world.Connect(root, hostB, hostLink);
+            world.SetHost(hostA);
+            world.SetHost(hostB);
+            var sent = world.HostSend(hostA, hostLink,
+                new[] { new Hop("host-a", "?") },
+                new[] { new Hop("host-b", "host-bus"), new Hop("app \"1\"/x@y", "ipc") },
+                "SomeEvent", new byte[] { 1, 2, 250 }, 9);
+            Expect(sent == HostSendResult.Sent, $"host send: {sent}");
+            Expect(world.HostSend(hostA, wifi, new[] { new Hop("host-a", "?") }, new[] { new Hop("*", "*") },
+                "x", null, 5) == HostSendResult.NotOnLink, "host send on a link the node is not on");
+            world.Tick();
+            var got = world.DrainHostDeliveries();
+            Expect(got.Count == 1 && got[0].Receiver == hostB && got[0].Link == hostLink, "host b got it");
+            Expect(got.Count == 1 && got[0].To[1].Node == "app \"1\"/x@y", "hop names survive the trip");
+            Expect(got.Count == 1 && got[0].Kind == "SomeEvent" && got[0].Data.Length == 3 && got[0].Data[2] == 250,
+                "kind and data survive the trip");
+            Expect(got.Count == 1 && got[0].Ttl == 8, "the delivery used one hop");
+            Expect(world.DrainHostDeliveries().Count == 0, "draining empties the queue");
+            var pushed = world.HostPush(hostB, new[] { new Hop("player", "tool-use") },
+                new[] { new Hop("host-b", "tool-use") }, "ToolUseSignal", null, 16, out var left);
+            Expect(pushed == HostPushResult.Delivered && left == 15, $"direct push: {pushed} {left}");
+            Expect(world.HostPush(hostB, new[] { new Hop("a", "b") }, new[] { new Hop("c", "d") }, "x", null, 1,
+                out _) == HostPushResult.Expired, "a direct push on its last hop is dropped");
+            Expect(world.HealthJson().Contains("\"direct_pushes\":2"), "direct pushes are counted");
+            Expect(world.HostPush(hostB, new[] { new Hop("a", "b") }, new[] { new Hop("c", "d") }, "x", null, null,
+                out var fresh) == HostPushResult.Delivered && fresh == 15, "no TTL means a fresh packet");
+
             // A broadcast storm: bridges joining two links in a loop. The fuse must trip, and the
             // report must say why, instead of the host running out of memory.
             var linkA = world.CreateLink("storm-a");

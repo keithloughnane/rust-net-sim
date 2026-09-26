@@ -114,6 +114,18 @@ pub struct FuseReport {
     pub recent_alerts: Vec<Alert>,
 }
 
+/// A packet handed to a host node ([`World::set_host`]), waiting for the host to collect it with
+/// [`World::drain_host_deliveries`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDelivery {
+    /// The host node it was delivered to.
+    pub receiver: NodeId,
+    /// The link it arrived on.
+    pub link: LinkId,
+    /// The packet, with this hop already counted against its TTL.
+    pub packet: Packet,
+}
+
 /// How a tick ended.
 #[must_use = "a tripped fuse means the network is running away; the host should react"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +163,12 @@ pub struct Health {
     pub trace_len: usize,
     /// Trace events lost because the buffer was full.
     pub trace_discarded: u64,
+    /// Deliveries to host nodes waiting to be collected.
+    pub host_pending: usize,
+    /// Deliveries to host nodes thrown away because the host did not collect them in time.
+    pub host_discarded: u64,
+    /// Packets the host handed straight to a node with [`World::push_direct`].
+    pub direct_pushes: u64,
 }
 
 /// A self-contained simulation: a [`Network`], the logic attached to its nodes, and the clock.
@@ -197,6 +215,10 @@ pub struct World {
     reserved: usize,
     /// `health.refused_sends` when the last tick ended.
     refused_seen: u64,
+    /// Nodes whose behaviour lives in the host rather than in a [`ControllerLogic`].
+    hosts: SecondaryMap<NodeId, ()>,
+    /// Packets delivered to host nodes, waiting for the host.
+    host_inbox: Vec<HostDelivery>,
 }
 
 impl World {
@@ -261,6 +283,7 @@ impl World {
         Health {
             tick: self.tick_count,
             pending: self.pending.len(),
+            host_pending: self.host_inbox.len(),
             alerts: self.monitor.alerts_raised,
             trace_len: self.trace.len(),
             trace_discarded: self.trace.discarded(),
@@ -286,8 +309,149 @@ impl World {
         for n in removed {
             self.logics.remove(n);
             self.stats.remove(n);
+            self.hosts.remove(n);
         }
         Ok(())
+    }
+
+    /// Most deliveries kept for host nodes before the oldest uncollected ones are thrown away.
+    pub const MAX_HOST_INBOX: usize = 200_000;
+
+    /// Makes `node` a host node, or an ordinary one again.
+    ///
+    /// A host node's behaviour lives in the host (a game engine, say) instead of a
+    /// [`ControllerLogic`]: every packet on its links is handed over, whatever the accept rules
+    /// would say, and the host decides what it means. The host collects them after each tick with
+    /// [`drain_host_deliveries`](Self::drain_host_deliveries) and answers with
+    /// [`send_packet`](Self::send_packet). Making a node a host node removes its logic.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the node does not exist.
+    pub fn set_host(&mut self, node: NodeId, host: bool) -> Result<(), LogicError> {
+        if self.network.node(node).is_none() {
+            return Err(LogicError::UnknownNode(node));
+        }
+        if host {
+            self.logics.remove(node);
+            self.hosts.insert(node, ());
+        } else {
+            self.hosts.remove(node);
+        }
+        self.topology_changed = true;
+        Ok(())
+    }
+
+    /// Whether `node` is a host node.
+    #[must_use]
+    pub fn is_host(&self, node: NodeId) -> bool {
+        self.hosts.contains_key(node)
+    }
+
+    /// Queues a packet with every field chosen by the caller: the routes, the event and the
+    /// remaining hop budget. This is how a host node sends, replies and forwards. It is delivered
+    /// on the next tick.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the node or link does not exist, the node is not on the link, the event is
+    /// too large, or the queue is full.
+    pub fn send_packet(
+        &mut self,
+        node: NodeId,
+        via: LinkId,
+        from: PacketRoute,
+        to: PacketRoute,
+        event: Event,
+        ttl: u8,
+    ) -> Result<(), SendError> {
+        let mut out = outgoing(
+            &self.network,
+            &self.limits,
+            node,
+            via,
+            Some(Arc::new(from)),
+            Arc::new(to),
+            Arc::new(event),
+        )?;
+        out.ttl = ttl;
+        SendQueue {
+            items: &mut self.pending,
+            limits: &self.limits,
+            reserved: self.reserved,
+            refused: &mut self.health.refused_sends,
+        }
+        .push(out)
+    }
+
+    /// Hands a packet straight to `receiver` now: no link, no queue, no tick. For a host that has to
+    /// deliver something immediately (a tool touching a device, an app being woken inside its own
+    /// computer). It still counts as traffic: it spends a hop of `ttl`, is counted in
+    /// [`Health::direct_pushes`] and the receiver's stats, is recorded in the trace as
+    /// [`TraceEvent::Pushed`], and the monitor sees it. The host delivers the returned packet itself;
+    /// `None` means its hop budget ran out and it was dropped.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the node does not exist or the event is too large.
+    pub fn push_direct(
+        &mut self,
+        receiver: NodeId,
+        from: PacketRoute,
+        to: PacketRoute,
+        event: Event,
+        ttl: u8,
+    ) -> Result<Option<Packet>, SendError> {
+        if self.network.node(receiver).is_none() {
+            return Err(SendError::UnknownNode(receiver));
+        }
+        if event.data.len() > self.limits.max_payload_bytes
+            || event.kind.len() > crate::logic::MAX_KIND_LEN
+        {
+            return Err(SendError::PayloadTooLarge);
+        }
+        self.next_packet += 1;
+        let tick = self.tick_count;
+        let packet = Packet {
+            id: PacketId(self.next_packet),
+            from: Arc::new(from),
+            to: Arc::new(to),
+            event: Arc::new(event),
+            ttl: ttl.saturating_sub(1),
+            trace: vec![receiver],
+        };
+        self.health.direct_pushes += 1;
+        if packet.ttl == 0 {
+            self.health.ttl_drops += 1;
+            self.monitor.on_ttl_expired(&mut self.trace, tick, receiver);
+            if self.trace_packets {
+                self.trace.push(TraceEvent::Dropped {
+                    tick,
+                    packet: packet.id,
+                    at: Some(receiver),
+                    reason: DropReason::TtlExpired,
+                });
+            }
+            return Ok(None);
+        }
+        if let Some(e) = self.stats.entry(receiver) {
+            e.or_default().received += 1;
+        }
+        self.monitor
+            .on_delivered(&mut self.trace, tick, receiver, &packet);
+        if self.trace_packets {
+            self.trace.push(TraceEvent::Pushed {
+                tick,
+                packet: packet.clone(),
+                receiver,
+            });
+        }
+        Ok(Some(packet))
+    }
+
+    /// Everything delivered to host nodes since the last call, in delivery order.
+    pub fn drain_host_deliveries(&mut self) -> Vec<HostDelivery> {
+        std::mem::take(&mut self.host_inbox)
     }
 
     /// Attaches `logic` to `node`, replacing any it had, and runs its `on_start`.
@@ -527,6 +691,19 @@ impl World {
         sent
     }
 
+    /// Keeps a delivery for the host, throwing the oldest away if the host has stopped collecting.
+    fn hand_to_host(&mut self, receiver: NodeId, link: LinkId, packet: Packet) {
+        if self.host_inbox.len() >= Self::MAX_HOST_INBOX {
+            self.host_inbox.remove(0);
+            self.health.host_discarded += 1;
+        }
+        self.host_inbox.push(HostDelivery {
+            receiver,
+            link,
+            packet,
+        });
+    }
+
     /// Puts one packet on its link and hands a copy to every listener that accepts it. Returns
     /// how many copies were delivered, or `None` if nothing was transmitted.
     fn transmit(&mut self, tick: u64, out: Outgoing) -> Option<u64> {
@@ -569,10 +746,15 @@ impl World {
         let mut delivered = 0;
         for listener in audience {
             let link = self.network.link(out.via)?;
+            let host = self.hosts.contains_key(listener);
             let wants = self.logics.get(listener).is_some_and(|l| l.wants(&packet));
-            let Some(rule) = accepts(&self.network, listener, &packet, link)
-                .or(wants.then_some(AcceptRule::Forced))
-            else {
+            let rule = if host {
+                Some(AcceptRule::Host)
+            } else {
+                accepts(&self.network, listener, &packet, link)
+                    .or(wants.then_some(AcceptRule::Forced))
+            };
+            let Some(rule) = rule else {
                 continue;
             };
             delivered += 1;
@@ -607,6 +789,10 @@ impl World {
                     link: out.via,
                     rule,
                 });
+            }
+            if host {
+                self.hand_to_host(listener, out.via, copy);
+                continue;
             }
             let sent = self.run_logic(tick, listener, Some((out.via, rule)), |logic, ctx| {
                 logic.on_received(&copy, ctx);
@@ -1147,6 +1333,94 @@ mod tests {
             world.send(nodes[0], bus, "b@bus".parse()?, Event::with_data("x", big)),
             Err(SendError::PayloadTooLarge)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn host_nodes_hear_everything_on_their_links_and_send_full_packets() -> TestResult {
+        let mut world = World::new();
+        let net = world.network_mut();
+        let wifi = net.create_link("wifi")?;
+        let (a, b, c) = (
+            net.create_node("a", "device")?,
+            net.create_node("b", "device")?,
+            net.create_node("c", "device")?,
+        );
+        let root = net.root();
+        for n in [a, b, c] {
+            net.connect(root, n, Some(wifi))?;
+        }
+        world.set_logic_kind(b, "responder")?;
+        world.set_host(a, true)?;
+        world.set_host(c, true)?;
+        assert!(world.is_host(a) && !world.is_host(b));
+
+        // A packet addressed to b: the responder accepts it by the rules, host c hears it too.
+        let from: PacketRoute = "a@wifi".parse()?;
+        let to: PacketRoute = "b@wifi/inner@ipc".parse()?;
+        world.send_packet(a, wifi, from.clone(), to.clone(), Event::new("ping"), 5)?;
+        assert_eq!(world.tick(), TickOutcome::Completed);
+        let got = world.drain_host_deliveries();
+        assert_eq!(got.len(), 1, "the sender does not hear itself");
+        assert_eq!((got[0].receiver, got[0].link), (c, wifi));
+        assert_eq!(got[0].packet.from(), &from);
+        assert_eq!(got[0].packet.to(), &to);
+        assert_eq!(
+            got[0].packet.ttl(),
+            4,
+            "the hop counts against the TTL it was sent with"
+        );
+        assert!(world.drain_host_deliveries().is_empty());
+
+        // The responder's reply to a reaches host a (and host c overhears it).
+        assert_eq!(world.tick(), TickOutcome::Completed);
+        let got = world.drain_host_deliveries();
+        let receivers: Vec<NodeId> = got.iter().map(|d| d.receiver).collect();
+        assert_eq!(receivers, [a, c]);
+        assert_eq!(got[0].packet.event().kind, "pong");
+        assert_eq!(world.health().host_pending, 0);
+
+        // A last hop is dropped, not handed over.
+        world.send_packet(a, wifi, from, to, Event::new("ping"), 1)?;
+        let _ = world.tick();
+        assert!(world.drain_host_deliveries().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn direct_pushes_are_delivered_now_and_counted() -> TestResult {
+        let mut world = World::new();
+        let node = world.network_mut().create_node("device", "device")?;
+        world.set_host(node, true)?;
+        let from: PacketRoute = "player@tool-use".parse()?;
+        let to: PacketRoute = "device@tool-use".parse()?;
+        let pushed = world
+            .push_direct(
+                node,
+                from.clone(),
+                to.clone(),
+                Event::new("ToolUseSignal"),
+                16,
+            )?
+            .ok_or("delivered")?;
+        assert_eq!((pushed.ttl(), pushed.to()), (15, &to));
+        assert_eq!(world.health().direct_pushes, 1);
+        assert_eq!(world.stats(node).received, 1);
+        assert!(world.drain_trace().iter().any(|e| matches!(
+            e,
+            TraceEvent::Pushed { receiver, .. } if *receiver == node
+        )));
+        assert!(
+            world.drain_host_deliveries().is_empty(),
+            "the host delivers it itself"
+        );
+        // A packet on its last hop is dropped, not handed over.
+        assert!(
+            world
+                .push_direct(node, from, to, Event::new("x"), 1)?
+                .is_none()
+        );
+        assert_eq!(world.health().ttl_drops, 1);
         Ok(())
     }
 

@@ -43,7 +43,9 @@ pub use network::{ControlNode, Link, Network, NetworkError};
 pub use packet::{Event, Packet, PacketId};
 pub use route::{Hop, PacketRoute, RouteError, names};
 pub use trace::{DropReason, TraceEvent};
-pub use world::{FuseLimit, FuseReport, Health, Limits, LogicError, NodeStats, TickOutcome, World};
+pub use world::{
+    FuseLimit, FuseReport, Health, HostDelivery, Limits, LogicError, NodeStats, TickOutcome, World,
+};
 
 /// The version of this crate, as set in `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

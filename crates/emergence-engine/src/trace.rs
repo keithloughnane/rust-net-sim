@@ -40,6 +40,16 @@ pub enum TraceEvent {
         /// Why it was accepted.
         rule: AcceptRule,
     },
+    /// The host handed `packet` straight to `receiver`, with no link and no tick
+    /// ([`World::push_direct`](crate::World::push_direct)).
+    Pushed {
+        /// Tick it happened on.
+        tick: u64,
+        /// The packet as delivered, with the hop already counted against its TTL.
+        packet: Packet,
+        /// The node it was handed to.
+        receiver: NodeId,
+    },
     /// A packet, or one copy of it, was discarded.
     Dropped {
         /// Tick it happened on.

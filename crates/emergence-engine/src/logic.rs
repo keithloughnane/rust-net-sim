@@ -63,6 +63,9 @@ pub enum AcceptRule {
     Gateway,
     /// Accepted because the node's logic asked for it ([`ControllerLogic::wants`]).
     Forced,
+    /// Handed to a host node, whose host applies its own accept rules
+    /// ([`World::set_host`](crate::World::set_host)).
+    Host,
 }
 
 /// Why a send was refused.

@@ -20,7 +20,7 @@ use crate::snapshot::{Snapshot, SnapshotError};
 use crate::trace::TraceEntry;
 
 /// ABI version this module was written against (`EMERGENCE_ABI_VERSION` in the header).
-const EXPECTED_ABI_VERSION: u32 = 5;
+const EXPECTED_ABI_VERSION: u32 = 8;
 
 /// Environment variable that overrides where the library is loaded from.
 const LIB_PATH_VAR: &str = "EMERGENCE_LIB";

@@ -22,7 +22,7 @@ namespace Emergence.Native
         /// <summary>
         ///  Version of the C ABI. Bump whenever an exported signature or type layout changes.
         /// </summary>
-        internal const uint EMERGENCE_ABI_VERSION = 5;
+        internal const uint EMERGENCE_ABI_VERSION = 8;
 
 
 
@@ -378,6 +378,76 @@ namespace Emergence.Native
         /// </summary>
         [DllImport(__DllName, EntryPoint = "emergence_world_send", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern EmergenceStatus emergence_world_send(EmergenceWorld* world, EmergenceNodeId node, byte* via_link, byte* to_route, byte* event_kind, byte* data, System.UIntPtr data_len);
+
+        /// <summary>
+        ///  Makes `node` a host node (`host` true) or an ordinary node again (`host` false).
+        ///
+        ///  A host node's behaviour lives in the host: every packet on its links is handed over, whatever
+        ///  the accept rules would say, to be collected with [`emergence_world_drain_host_deliveries_json`]
+        ///  after each tick. It sends with [`emergence_world_host_send`]. Making a node a host node removes
+        ///  its logic.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_set_host", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_set_host(EmergenceWorld* world, EmergenceNodeId node, [MarshalAs(UnmanagedType.U1)] bool host);
+
+        /// <summary>
+        ///  Queues a packet from `node` on `link` with every field chosen by the host: how a host node
+        ///  sends, replies and forwards. It is delivered on the next [`emergence_world_tick`].
+        ///
+        ///  - `from_route` and `to_route` are JSON arrays of `[node, link]` pairs, head first, such as
+        ///    `[["pc-1","wifi"],["fileman","ipc"]]`. Hop names are taken as they are (they are addresses,
+        ///    not the names of nodes in this world), so any text is allowed.
+        ///  - `ttl` is the hop budget left, for loop protection; each delivery uses one, and the last is
+        ///    never delivered. 0 means a fresh packet, which starts with the library's default budget.
+        ///    Pass on a delivered packet's `ttl` when forwarding it, so loops still run out.
+        ///  - `data` may be null when `data_len` is 0.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. The strings must be
+        ///  null or NUL-terminated. `data` must be null or valid for `data_len` bytes.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_host_send", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_host_send(EmergenceWorld* world, EmergenceNodeId node, EmergenceLinkId link, byte* from_route, byte* to_route, byte* event_kind, byte* data, System.UIntPtr data_len, byte ttl);
+
+        /// <summary>
+        ///  Hands a packet straight to host node `node` now: no link, no queue, no tick. For a host that
+        ///  must deliver something immediately. It still counts as traffic: it spends a hop of `ttl`, is
+        ///  counted (`direct_pushes` in [`emergence_world_health_json`]), traced as `"pushed"` and seen by
+        ///  the monitor. The host delivers the packet itself; `out_ttl` receives the hop budget left, or 0
+        ///  if it ran out and the packet was dropped. As for [`emergence_world_host_send`], a `ttl` of 0
+        ///  means a fresh packet.
+        ///
+        ///  Routes are JSON arrays of `[node, link]` pairs, as for [`emergence_world_host_send`].
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. The strings must be
+        ///  null or NUL-terminated. `data` must be null or valid for `data_len` bytes. `out_ttl` must be
+        ///  null or valid for a one-byte write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_host_push", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_host_push(EmergenceWorld* world, EmergenceNodeId node, byte* from_route, byte* to_route, byte* event_kind, byte* data, System.UIntPtr data_len, byte ttl, byte* out_ttl);
+
+        /// <summary>
+        ///  Writes everything delivered to host nodes since the last call to `out_json`, in delivery
+        ///  order, and clears it. Free the string with [`emergence_string_free`].
+        ///
+        ///  The format is `{"deliveries":[{"receiver":n,"link":n,"from":[[node,link],...],"to":[...],
+        ///  "kind":"...","data":"hex","ttl":n},...]}`, where `receiver` and `link` are raw handle values
+        ///  and `data` is the payload as lowercase hex.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+        ///  or valid for a pointer-sized write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_drain_host_deliveries_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_drain_host_deliveries_json(EmergenceWorld* world, byte** out_json);
 
         /// <summary>
         ///  Writes a JSON description of everything that happened since the last call (packets sent,
