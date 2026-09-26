@@ -340,8 +340,7 @@ impl SandboxApp {
         }
         let apps: Vec<&str> = c.apps.iter().map(|a| a.name.as_str()).collect();
         let _ = writeln!(text, "\napps: {}", apps.join(", "));
-        let _ = writeln!(text, "hardware: {}", c.hardware.join(", "));
-        let _ = write!(text, "npc roles: {}", c.npc_roles.join(", "));
+        let _ = write!(text, "hardware: {}", c.hardware.join(", "));
         Response::ok(text, c.defaults.clone())
     }
 

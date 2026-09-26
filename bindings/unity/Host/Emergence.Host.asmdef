@@ -1,0 +1,9 @@
+{
+  "name": "Emergence.Host",
+  "rootNamespace": "Emergence.Host",
+  "references": [
+    "Emergence.Runtime"
+  ],
+  "autoReferenced": true,
+  "noEngineReferences": true
+}

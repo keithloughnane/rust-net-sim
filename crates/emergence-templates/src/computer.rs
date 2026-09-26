@@ -180,6 +180,9 @@ impl HardwareTag {
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct ComputerSpec {
+    /// The computer's system services, by node name. Left out, it gets [`BASE_SERVICES`]. A host
+    /// passes its own names so the nodes match the addresses its software already uses.
+    pub services: Option<Vec<String>>,
     /// Installed apps, from the fixed catalogue. Each at most once.
     pub apps: Vec<AppKind>,
     /// Hardware capabilities.
@@ -191,9 +194,10 @@ pub struct ComputerSpec {
 ///
 /// Atomic: if it fails, nothing is left in the world.
 ///
-/// Inside: a `kernel` root that is the computer's gateway, an `ipc` bus, the
-/// [`BASE_SERVICES`], and one node per installed app. Callers should treat the insides as
-/// private; they may grow.
+/// Inside: a `kernel` root that is the computer's gateway, an `ipc` bus, its services
+/// ([`ComputerSpec::services`], or the [`BASE_SERVICES`]), and one node per installed app. Callers
+/// should treat the insides as private; they may grow. More apps can be installed later with
+/// [`install_app`].
 ///
 /// ```
 /// use emergence_engine::World;
@@ -211,28 +215,45 @@ pub struct ComputerSpec {
 ///
 /// # Errors
 ///
-/// Fails, without building anything, if the name is invalid or used by something inside the
-/// computer, or an app is listed twice.
+/// Fails, without building anything, if a name is invalid, the computer's name is used by
+/// something inside it, an app is listed twice, or two things inside share a name.
 pub fn build_computer(
     world: &mut World,
     name: &str,
     spec: &ComputerSpec,
 ) -> Result<NodeId, TemplateError> {
     emergence_engine::Network::validate_name(name)?;
-    let inside = BASE_SERVICES
-        .iter()
-        .map(|&(service, _)| service)
-        .chain(spec.apps.iter().map(|a| a.name()));
-    if inside.clone().any(|n| n == name) {
-        return Err(TemplateError::NameUsedInside(name.to_owned()));
-    }
     let mut seen = BTreeSet::new();
     if let Some(&twice) = spec.apps.iter().find(|&&app| !seen.insert(app)) {
         return Err(TemplateError::AppInstalledTwice(twice));
     }
+    let services = services(spec);
+    let inside: Vec<&str> = services
+        .iter()
+        .copied()
+        .chain(spec.apps.iter().map(|a| a.name()))
+        .collect();
+    if inside.contains(&name) {
+        return Err(TemplateError::NameUsedInside(name.to_owned()));
+    }
+    let mut names = BTreeSet::new();
+    for &part in &inside {
+        emergence_engine::Network::validate_name(part)?;
+        if !names.insert(part) {
+            return Err(TemplateError::NameUsedTwice(part.to_owned()));
+        }
+    }
 
     let root = world.network_mut().create_node(name, "computer")?;
     crate::or_remove(world, root, |world| fill_computer(world, root, spec))
+}
+
+/// The names of a computer's services: the spec's, or the [`BASE_SERVICES`].
+fn services(spec: &ComputerSpec) -> Vec<&str> {
+    spec.services.as_ref().map_or_else(
+        || BASE_SERVICES.iter().map(|&(service, _)| service).collect(),
+        |names| names.iter().map(String::as_str).collect(),
+    )
 }
 
 /// Everything inside a computer. On error, the caller removes `root` and all of this with it.
@@ -247,9 +268,9 @@ fn fill_computer(
         let _ = net.remove_link(ipc);
         return Err(e.into());
     }
-    let parts = BASE_SERVICES
-        .iter()
-        .map(|&(service, _)| {
+    let parts = services(spec)
+        .into_iter()
+        .map(|service| {
             (
                 service,
                 "service",
@@ -288,6 +309,43 @@ pub fn build_computer_at(
 ) -> Result<NodeId, TemplateError> {
     let root = build_computer(world, name, spec)?;
     crate::attach_or_remove(world, root, at)
+}
+
+/// Installs one app from the catalogue into an existing computer, for launching apps while the
+/// game runs: a node called `name` (the app's own [`name`](AppKind::name) if `None`) on the
+/// computer's `ipc` bus. Several copies of an app can run side by side under different names.
+///
+/// Atomic: if it fails, nothing is left behind.
+///
+/// # Errors
+///
+/// Fails if `computer` has no `ipc` bus ([`TemplateError::NotAComputer`]), the name is invalid,
+/// or something on the bus already has that name.
+pub fn install_app(
+    world: &mut World,
+    computer: NodeId,
+    app: AppKind,
+    name: Option<&str>,
+) -> Result<NodeId, TemplateError> {
+    let name = name.unwrap_or(app.name());
+    let ipc = world
+        .network()
+        .node(computer)
+        .and_then(|c| {
+            c.internal_links().iter().copied().find(|&l| {
+                world
+                    .network()
+                    .link(l)
+                    .is_some_and(|l| l.name() == names::IPC)
+            })
+        })
+        .ok_or(TemplateError::NotAComputer(computer))?;
+    let node = world.network_mut().create_node(name, "app")?;
+    crate::or_remove(world, node, |world| {
+        world.network_mut().connect(computer, node, Some(ipc))?;
+        world.set_logic(node, app.logic())?;
+        Ok(())
+    })
 }
 
 /// A computer's root logic: the gateway between its apps and the networks it is on, plus

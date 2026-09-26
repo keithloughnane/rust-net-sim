@@ -22,7 +22,7 @@ namespace Emergence.Native
         /// <summary>
         ///  Version of the C ABI. Bump whenever an exported signature or type layout changes.
         /// </summary>
-        internal const uint EMERGENCE_ABI_VERSION = 8;
+        internal const uint EMERGENCE_ABI_VERSION = 10;
 
 
 
@@ -252,7 +252,6 @@ namespace Emergence.Native
         ///  { "templates": [{"name": "computer", "description": "..."}, ...],
         ///    "apps": [{"name": "fileman", "title": "File manager"}, ...],
         ///    "hardware": ["wifi", "modem", "promiscuous-nic"],
-        ///    "npc_roles": ["guard", "civilian"],
         ///    "base_services": ["login-manager", ...],
         ///    "defaults": {"computer": {...spec...}, "npc": {...spec...}} }
         ///  ```
@@ -448,6 +447,87 @@ namespace Emergence.Native
         /// </summary>
         [DllImport(__DllName, EntryPoint = "emergence_world_drain_host_deliveries_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern EmergenceStatus emergence_world_drain_host_deliveries_json(EmergenceWorld* world, byte** out_json);
+
+        /// <summary>
+        ///  Writes the parent of `node` to `out_parent`, or "no node" (`raw == 0`) for the root or a node
+        ///  that is not nested anywhere.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `out_parent` must be null
+        ///  or valid for writing one ID.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_parent", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_parent(EmergenceWorld* world, EmergenceNodeId node, EmergenceNodeId* out_parent);
+
+        /// <summary>
+        ///  Writes the nodes nested directly inside `node`, in the order they were added. See
+        ///  [`emergence_network_subscribers`] for how the buffer works.
+        ///
+        ///  # Safety
+        ///
+        ///  As for [`emergence_network_subscribers`].
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_children", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_children(EmergenceWorld* world, EmergenceNodeId node, EmergenceNodeId* out_nodes, System.UIntPtr capacity, System.UIntPtr* out_len);
+
+        /// <summary>
+        ///  Writes the links `node` owns (its internal links, such as a computer's `ipc` bus). See
+        ///  [`emergence_network_subscribers`] for how the buffer works.
+        ///
+        ///  # Safety
+        ///
+        ///  As for [`emergence_network_subscribers`].
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_internal_links", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_internal_links(EmergenceWorld* world, EmergenceNodeId node, EmergenceLinkId* out_links, System.UIntPtr capacity, System.UIntPtr* out_len);
+
+        /// <summary>
+        ///  Writes the links `node` is subscribed to. See [`emergence_network_subscribers`] for how the
+        ///  buffer works.
+        ///
+        ///  # Safety
+        ///
+        ///  As for [`emergence_network_subscribers`].
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_subscriptions", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_subscriptions(EmergenceWorld* world, EmergenceNodeId node, EmergenceLinkId* out_links, System.UIntPtr capacity, System.UIntPtr* out_len);
+
+        /// <summary>
+        ///  Writes the nodes subscribed to `link`.
+        ///
+        ///  The list queries share one shape: up to `capacity` IDs are written to the buffer, and the full
+        ///  count to `out_len`. If the count is larger than `capacity`, call again with a buffer that
+        ///  big. The buffer may be null when `capacity` is 0, to ask for the count only.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. The buffer must be valid
+        ///  for writing `capacity` IDs (or null with `capacity` 0), and `out_len` for writing one `usize`.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_subscribers", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_subscribers(EmergenceWorld* world, EmergenceLinkId link, EmergenceNodeId* out_nodes, System.UIntPtr capacity, System.UIntPtr* out_len);
+
+        /// <summary>
+        ///  Writes the name of `node` to `out_name`. Free the string with [`emergence_string_free`].
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `out_name` must be null
+        ///  or valid for a pointer-sized write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_node_name", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_node_name(EmergenceWorld* world, EmergenceNodeId node, byte** out_name);
+
+        /// <summary>
+        ///  Writes the name of `link` to `out_name`. Free the string with [`emergence_string_free`].
+        ///
+        ///  # Safety
+        ///
+        ///  As for [`emergence_network_node_name`].
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_link_name", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_link_name(EmergenceWorld* world, EmergenceLinkId link, byte** out_name);
 
         /// <summary>
         ///  Writes a JSON description of everything that happened since the last call (packets sent,

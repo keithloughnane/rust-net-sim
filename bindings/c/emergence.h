@@ -10,7 +10,7 @@
 #include <stdlib.h>
 
 // Version of the C ABI. Bump whenever an exported signature or type layout changes.
-#define EMERGENCE_ABI_VERSION 8
+#define EMERGENCE_ABI_VERSION 10
 
 // Result of a fallible call. Always 32 bits wide, whatever the host compiler does with enums.
 enum EmergenceStatus
@@ -277,7 +277,6 @@ const char *emergence_logic_kinds_json(void);
 // { "templates": [{"name": "computer", "description": "..."}, ...],
 //   "apps": [{"name": "fileman", "title": "File manager"}, ...],
 //   "hardware": ["wifi", "modem", "promiscuous-nic"],
-//   "npc_roles": ["guard", "civilian"],
 //   "base_services": ["login-manager", ...],
 //   "defaults": {"computer": {...spec...}, "npc": {...spec...}} }
 // ```
@@ -473,6 +472,88 @@ EmergenceStatus emergence_world_host_push(struct EmergenceWorld *world,
 // or valid for a pointer-sized write.
 EmergenceStatus emergence_world_drain_host_deliveries_json(struct EmergenceWorld *world,
                                                            char **out_json);
+
+// Writes the parent of `node` to `out_parent`, or "no node" (`raw == 0`) for the root or a node
+// that is not nested anywhere.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `out_parent` must be null
+// or valid for writing one ID.
+EmergenceStatus emergence_network_parent(struct EmergenceWorld *world,
+                                         struct EmergenceNodeId node,
+                                         struct EmergenceNodeId *out_parent);
+
+// Writes the nodes nested directly inside `node`, in the order they were added. See
+// [`emergence_network_subscribers`] for how the buffer works.
+//
+// # Safety
+//
+// As for [`emergence_network_subscribers`].
+EmergenceStatus emergence_network_children(struct EmergenceWorld *world,
+                                           struct EmergenceNodeId node,
+                                           struct EmergenceNodeId *out_nodes,
+                                           size_t capacity,
+                                           size_t *out_len);
+
+// Writes the links `node` owns (its internal links, such as a computer's `ipc` bus). See
+// [`emergence_network_subscribers`] for how the buffer works.
+//
+// # Safety
+//
+// As for [`emergence_network_subscribers`].
+EmergenceStatus emergence_network_internal_links(struct EmergenceWorld *world,
+                                                 struct EmergenceNodeId node,
+                                                 struct EmergenceLinkId *out_links,
+                                                 size_t capacity,
+                                                 size_t *out_len);
+
+// Writes the links `node` is subscribed to. See [`emergence_network_subscribers`] for how the
+// buffer works.
+//
+// # Safety
+//
+// As for [`emergence_network_subscribers`].
+EmergenceStatus emergence_network_subscriptions(struct EmergenceWorld *world,
+                                                struct EmergenceNodeId node,
+                                                struct EmergenceLinkId *out_links,
+                                                size_t capacity,
+                                                size_t *out_len);
+
+// Writes the nodes subscribed to `link`.
+//
+// The list queries share one shape: up to `capacity` IDs are written to the buffer, and the full
+// count to `out_len`. If the count is larger than `capacity`, call again with a buffer that
+// big. The buffer may be null when `capacity` is 0, to ask for the count only.
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. The buffer must be valid
+// for writing `capacity` IDs (or null with `capacity` 0), and `out_len` for writing one `usize`.
+EmergenceStatus emergence_network_subscribers(struct EmergenceWorld *world,
+                                              struct EmergenceLinkId link,
+                                              struct EmergenceNodeId *out_nodes,
+                                              size_t capacity,
+                                              size_t *out_len);
+
+// Writes the name of `node` to `out_name`. Free the string with [`emergence_string_free`].
+//
+// # Safety
+//
+// `world` must be null or a live handle, not in use on another thread. `out_name` must be null
+// or valid for a pointer-sized write.
+EmergenceStatus emergence_network_node_name(struct EmergenceWorld *world,
+                                            struct EmergenceNodeId node,
+                                            char **out_name);
+
+// Writes the name of `link` to `out_name`. Free the string with [`emergence_string_free`].
+//
+// # Safety
+//
+// As for [`emergence_network_node_name`].
+EmergenceStatus emergence_network_link_name(struct EmergenceWorld *world,
+                                            struct EmergenceLinkId link,
+                                            char **out_name);
 
 // Writes a JSON description of everything that happened since the last call (packets sent,
 // delivered and dropped, and notes from logic) to `out_json`, and clears it. Free the string

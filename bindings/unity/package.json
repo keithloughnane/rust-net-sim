@@ -3,5 +3,5 @@
   "displayName": "Emergence Engine",
   "version": "0.1.0",
   "unity": "2022.3",
-  "description": "C# bindings for the Emergence Engine native library."
+  "description": "The Emergence Engine native library, its C# bindings (Emergence.Runtime), a host layer for C# nodes (Emergence.Host) and its Unity driver (Emergence.Unity)."
 }

@@ -38,7 +38,6 @@ pub(crate) struct AddNodeWindow {
     name: String,
     apps: BTreeSet<String>,
     hardware: BTreeSet<String>,
-    role: String,
     day_length: u64,
     schedule: String,
     lines: String,
@@ -70,10 +69,6 @@ impl AddNodeWindow {
 
     fn reset_npc(&mut self, catalog: &TemplateCatalog) {
         let npc = &catalog.defaults["npc"];
-        npc["role"]
-            .as_str()
-            .unwrap_or("civilian")
-            .clone_into(&mut self.role);
         self.day_length = npc["day_length"].as_u64().unwrap_or(240);
         self.schedule = npc["schedule"]
             .as_array()
@@ -113,7 +108,6 @@ impl AddNodeWindow {
                     .filter(|l| !l.is_empty())
                     .collect();
                 Ok(serde_json::json!({
-                    "role": self.role,
                     "day_length": self.day_length,
                     "schedule": schedule,
                     "lines": lines,
@@ -186,7 +180,7 @@ impl AddNodeWindow {
 
                 match self.template.as_str() {
                     "computer" => self.computer_ui(ui, catalog),
-                    "npc" => self.npc_ui(ui, catalog),
+                    "npc" => self.npc_ui(ui),
                     _ => {}
                 }
                 ui.separator();
@@ -310,15 +304,8 @@ impl AddNodeWindow {
         });
     }
 
-    fn npc_ui(&mut self, ui: &mut egui::Ui, catalog: &TemplateCatalog) {
+    fn npc_ui(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("add-npc").num_columns(2).show(ui, |ui| {
-            ui.label("Role");
-            ui.horizontal(|ui| {
-                for role in &catalog.npc_roles {
-                    ui.radio_value(&mut self.role, role.clone(), role);
-                }
-            });
-            ui.end_row();
             ui.label("Day length");
             ui.add(
                 egui::DragValue::new(&mut self.day_length)

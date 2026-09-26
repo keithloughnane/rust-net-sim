@@ -28,8 +28,9 @@ use emergence_engine::{ControllerLogic, LinkId, LogicError, NetworkError, NodeId
 
 pub use computer::{
     AppKind, BASE_SERVICES, ComputerSpec, HardwareTag, Kernel, build_computer, build_computer_at,
+    install_app,
 };
-pub use npc::{Npc, NpcRole, NpcSpec, build_npc, build_npc_at, events as npc_events};
+pub use npc::{Npc, NpcSpec, build_npc, build_npc_at, events as npc_events};
 
 /// Where a one-step build (`build_*_at`) attaches the new node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,8 +78,12 @@ pub const TEMPLATES: &[(&str, &str)] = &[
         "A computer: kernel, system services and installed apps on its own bus.",
     ),
     (
+        "app",
+        "One app from the catalogue, installed into an existing computer (build it at the computer).",
+    ),
+    (
         "npc",
-        "A non-player character with a schedule, dialogue and a reaction to the player.",
+        "The base of a non-player character: a schedule and dialogue.",
     ),
 ];
 
@@ -103,6 +108,10 @@ pub enum TemplateError {
     AppInstalledTwice(AppKind),
     /// The computer's name is also the name of something inside it (a service or an app).
     NameUsedInside(String),
+    /// Two things inside a computer (services or apps) have the same name.
+    NameUsedTwice(String),
+    /// An app was to be installed into a node that is not a computer: it has no `ipc` bus.
+    NotAComputer(NodeId),
     /// The [`NpcSpec`] does not make sense.
     Npc(NpcSpecProblem),
     /// The network refused a node, link or connection: an invalid name, a name clash, a
@@ -150,6 +159,10 @@ impl fmt::Display for TemplateError {
                 f,
                 "a computer cannot be called `{name}`: that is the name of something inside it"
             ),
+            Self::NameUsedTwice(name) => {
+                write!(f, "two things inside the computer are called `{name}`")
+            }
+            Self::NotAComputer(_) => f.write_str("apps can only be installed into a computer"),
             Self::Npc(problem) => write!(f, "invalid NPC: {problem}"),
             Self::Network(e) => e.fmt(f),
             Self::Logic(e) => e.fmt(f),
@@ -288,10 +301,9 @@ mod tests {
     }
 
     #[test]
-    fn an_npc_follows_its_schedule_talks_and_reacts() -> TestResult {
+    fn an_npc_follows_its_schedule_and_talks() -> TestResult {
         let mut world = World::new();
         let spec = NpcSpec {
-            role: NpcRole::Guard,
             day_length: 10,
             schedule: vec![(0, "patrol".into()), (5, "rest".into())],
             lines: vec!["Halt!".into()],
@@ -317,18 +329,53 @@ mod tests {
             "guard@hall".parse()?,
             Event::new(npc_events::TALK),
         )?;
-        world.send(
-            player,
-            hall,
-            "guard@hall".parse()?,
-            Event::new(npc_events::PLAYER_SEEN),
-        )?;
+        let received = world.stats(player).received;
         let _ = world.tick();
         let _ = world.tick();
-        assert!(notes(&mut world).iter().any(|n| n.contains("alarm")));
         assert!(
-            world.stats(player).received >= 2,
-            "got the line and the alarm"
+            world.stats(player).received > received,
+            "the player heard its line"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_host_names_the_services_and_installs_apps_later() -> TestResult {
+        let mut world = World::new();
+        let spec = ComputerSpec {
+            services: Some(vec!["LoginMan".into(), "registry.sys".into()]),
+            ..ComputerSpec::default()
+        };
+        let pc = build_computer(&mut world, "pc-1", &spec)?;
+        assert_eq!(names_inside(&world, pc), ["LoginMan", "registry.sys"]);
+
+        let first = install_app(&mut world, pc, AppKind::FileManager, None)?;
+        let second = install_app(&mut world, pc, AppKind::FileManager, Some("fileman-2"))?;
+        assert_ne!(first, second);
+        assert_eq!(
+            names_inside(&world, pc),
+            ["LoginMan", "registry.sys", "fileman", "fileman-2"]
+        );
+        // A name already on the bus, or a node that is not a computer, leaves nothing behind.
+        let nodes = world.network().nodes().len();
+        assert!(matches!(
+            install_app(&mut world, pc, AppKind::Mail, Some("fileman")),
+            Err(TemplateError::Network(NetworkError::NameConflict { .. }))
+        ));
+        assert_eq!(
+            install_app(&mut world, first, AppKind::Mail, None),
+            Err(TemplateError::NotAComputer(first))
+        );
+        assert_eq!(world.network().nodes().len(), nodes);
+
+        let twice = ComputerSpec {
+            services: Some(vec!["mail".into()]),
+            apps: vec![AppKind::Mail],
+            ..ComputerSpec::default()
+        };
+        assert_eq!(
+            build_computer(&mut world, "pc-2", &twice),
+            Err(TemplateError::NameUsedTwice("mail".into()))
         );
         Ok(())
     }

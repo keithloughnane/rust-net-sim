@@ -1,0 +1,10 @@
+{
+  "name": "Emergence.Unity",
+  "rootNamespace": "Emergence.Unity",
+  "references": [
+    "Emergence.Runtime",
+    "Emergence.Host"
+  ],
+  "autoReferenced": true,
+  "noEngineReferences": false
+}

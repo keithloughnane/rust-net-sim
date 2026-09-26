@@ -20,7 +20,7 @@ use crate::snapshot::{Snapshot, SnapshotError};
 use crate::trace::TraceEntry;
 
 /// ABI version this module was written against (`EMERGENCE_ABI_VERSION` in the header).
-const EXPECTED_ABI_VERSION: u32 = 8;
+const EXPECTED_ABI_VERSION: u32 = 10;
 
 /// Environment variable that overrides where the library is loaded from.
 const LIB_PATH_VAR: &str = "EMERGENCE_LIB";
@@ -45,7 +45,6 @@ pub(crate) struct TemplateCatalog {
     pub(crate) templates: Vec<TemplateInfo>,
     pub(crate) apps: Vec<AppInfo>,
     pub(crate) hardware: Vec<String>,
-    pub(crate) npc_roles: Vec<String>,
     pub(crate) defaults: serde_json::Value,
 }
 

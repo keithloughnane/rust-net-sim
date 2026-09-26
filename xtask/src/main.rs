@@ -121,12 +121,16 @@ fn sandbox(release: bool) -> Result {
 fn test_csharp(release: bool) -> Result {
     build_native(release)?;
     let lib = profile_dir(release).join(dylib_name());
-    run_command(
-        Command::new("dotnet")
-            .current_dir(root().join("bindings/csharp-smoke"))
-            .arg("run")
-            .arg(format!("-p:EmergenceNativeLib={}", lib.display())),
-    )
+    // The bindings, then the host layer built on them.
+    for project in ["bindings/csharp-smoke", "bindings/csharp-host-smoke"] {
+        run_command(
+            Command::new("dotnet")
+                .current_dir(root().join(project))
+                .arg("run")
+                .arg(format!("-p:EmergenceNativeLib={}", lib.display())),
+        )?;
+    }
+    Ok(())
 }
 
 /// A platform the packages ship a native library for.
