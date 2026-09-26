@@ -22,7 +22,7 @@ namespace Emergence.Native
         /// <summary>
         ///  Version of the C ABI. Bump whenever an exported signature or type layout changes.
         /// </summary>
-        internal const uint EMERGENCE_ABI_VERSION = 4;
+        internal const uint EMERGENCE_ABI_VERSION = 8;
 
 
 
@@ -202,6 +202,27 @@ namespace Emergence.Native
         internal static extern EmergenceStatus emergence_network_disconnect(EmergenceWorld* world, EmergenceNodeId parent, EmergenceNodeId node);
 
         /// <summary>
+        ///  Deletes `node`, everything nested inside it, and the links they own. Other nodes lose their
+        ///  subscriptions to those links. IDs of removed nodes and links never resolve again.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_remove_node", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_remove_node(EmergenceWorld* world, EmergenceNodeId node);
+
+        /// <summary>
+        ///  Deletes `link`. Its subscribers and owner stay; they just lose the link.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_remove_link", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_remove_link(EmergenceWorld* world, EmergenceLinkId link);
+
+        /// <summary>
         ///  Writes a JSON description of the whole network to `out_json`. Free it with
         ///  [`emergence_string_free`].
         ///
@@ -223,6 +244,66 @@ namespace Emergence.Native
         /// </summary>
         [DllImport(__DllName, EntryPoint = "emergence_logic_kinds_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern byte* emergence_logic_kinds_json();
+
+        /// <summary>
+        ///  Returns the template catalogue as a static JSON string. Do not free it. Shape:
+        ///
+        ///  ```json
+        ///  { "templates": [{"name": "computer", "description": "..."}, ...],
+        ///    "apps": [{"name": "fileman", "title": "File manager"}, ...],
+        ///    "hardware": ["wifi", "modem", "promiscuous-nic"],
+        ///    "npc_roles": ["guard", "civilian"],
+        ///    "base_services": ["login-manager", ...],
+        ///    "defaults": {"computer": {...spec...}, "npc": {...spec...}} }
+        ///  ```
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_templates_catalog_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern byte* emergence_templates_catalog_json();
+
+        /// <summary>
+        ///  Builds a node from a template and writes its root to `out_root`. The node is detached:
+        ///  attach it with [`emergence_network_connect`].
+        ///
+        ///  `template` is a name from [`emergence_templates_catalog_json`]. `spec_json` holds that
+        ///  template's parameters; missing fields take their defaults, and null or `""` means all
+        ///  defaults. For example, for `"computer"`:
+        ///  `{"apps": ["fileman", "net-scan"], "hardware": ["wifi"]}`.
+        ///
+        ///  On failure, [`emergence_world_last_error`] says why.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `template` and `name`
+        ///  must be null or NUL-terminated strings; `spec_json` may be null. `out_root` must be null or
+        ///  valid for a write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_template_build", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_template_build(EmergenceWorld* world, byte* template, byte* name, byte* spec_json, EmergenceNodeId* out_root);
+
+        /// <summary>
+        ///  Builds a node from a template and connects it in one step: nested in `parent`, on `link`
+        ///  (`raw == 0` for no link). If building or connecting fails, nothing is left in the world:
+        ///  compare [`emergence_template_build`] followed by [`emergence_network_connect`], where a failed
+        ///  connect leaves the node built but detached.
+        ///
+        ///  # Safety
+        ///
+        ///  As for [`emergence_template_build`].
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_template_build_at", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_template_build_at(EmergenceWorld* world, byte* template, byte* name, byte* spec_json, EmergenceNodeId parent, EmergenceLinkId link, EmergenceNodeId* out_root);
+
+        /// <summary>
+        ///  Returns a description of the last error on this world that had more to say than its status
+        ///  code (today: template builds), or `""`. The string belongs to the world and stays valid until
+        ///  the next such error or until the world is destroyed. Do not free it.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_last_error", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern byte* emergence_world_last_error(EmergenceWorld* world);
 
         /// <summary>
         ///  Sets the fuse's hard limits. 0 keeps a limit's current value.
@@ -299,6 +380,76 @@ namespace Emergence.Native
         internal static extern EmergenceStatus emergence_world_send(EmergenceWorld* world, EmergenceNodeId node, byte* via_link, byte* to_route, byte* event_kind, byte* data, System.UIntPtr data_len);
 
         /// <summary>
+        ///  Makes `node` a host node (`host` true) or an ordinary node again (`host` false).
+        ///
+        ///  A host node's behaviour lives in the host: every packet on its links is handed over, whatever
+        ///  the accept rules would say, to be collected with [`emergence_world_drain_host_deliveries_json`]
+        ///  after each tick. It sends with [`emergence_world_host_send`]. Making a node a host node removes
+        ///  its logic.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_set_host", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_set_host(EmergenceWorld* world, EmergenceNodeId node, [MarshalAs(UnmanagedType.U1)] bool host);
+
+        /// <summary>
+        ///  Queues a packet from `node` on `link` with every field chosen by the host: how a host node
+        ///  sends, replies and forwards. It is delivered on the next [`emergence_world_tick`].
+        ///
+        ///  - `from_route` and `to_route` are JSON arrays of `[node, link]` pairs, head first, such as
+        ///    `[["pc-1","wifi"],["fileman","ipc"]]`. Hop names are taken as they are (they are addresses,
+        ///    not the names of nodes in this world), so any text is allowed.
+        ///  - `ttl` is the hop budget left, for loop protection; each delivery uses one, and the last is
+        ///    never delivered. 0 means a fresh packet, which starts with the library's default budget.
+        ///    Pass on a delivered packet's `ttl` when forwarding it, so loops still run out.
+        ///  - `data` may be null when `data_len` is 0.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. The strings must be
+        ///  null or NUL-terminated. `data` must be null or valid for `data_len` bytes.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_host_send", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_host_send(EmergenceWorld* world, EmergenceNodeId node, EmergenceLinkId link, byte* from_route, byte* to_route, byte* event_kind, byte* data, System.UIntPtr data_len, byte ttl);
+
+        /// <summary>
+        ///  Hands a packet straight to host node `node` now: no link, no queue, no tick. For a host that
+        ///  must deliver something immediately. It still counts as traffic: it spends a hop of `ttl`, is
+        ///  counted (`direct_pushes` in [`emergence_world_health_json`]), traced as `"pushed"` and seen by
+        ///  the monitor. The host delivers the packet itself; `out_ttl` receives the hop budget left, or 0
+        ///  if it ran out and the packet was dropped. As for [`emergence_world_host_send`], a `ttl` of 0
+        ///  means a fresh packet.
+        ///
+        ///  Routes are JSON arrays of `[node, link]` pairs, as for [`emergence_world_host_send`].
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. The strings must be
+        ///  null or NUL-terminated. `data` must be null or valid for `data_len` bytes. `out_ttl` must be
+        ///  null or valid for a one-byte write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_host_push", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_host_push(EmergenceWorld* world, EmergenceNodeId node, byte* from_route, byte* to_route, byte* event_kind, byte* data, System.UIntPtr data_len, byte ttl, byte* out_ttl);
+
+        /// <summary>
+        ///  Writes everything delivered to host nodes since the last call to `out_json`, in delivery
+        ///  order, and clears it. Free the string with [`emergence_string_free`].
+        ///
+        ///  The format is `{"deliveries":[{"receiver":n,"link":n,"from":[[node,link],...],"to":[...],
+        ///  "kind":"...","data":"hex","ttl":n},...]}`, where `receiver` and `link` are raw handle values
+        ///  and `data` is the payload as lowercase hex.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `out_json` must be null
+        ///  or valid for a pointer-sized write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_drain_host_deliveries_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_world_drain_host_deliveries_json(EmergenceWorld* world, byte** out_json);
+
+        /// <summary>
         ///  Writes a JSON description of everything that happened since the last call (packets sent,
         ///  delivered and dropped, and notes from logic) to `out_json`, and clears it. Free the string
         ///  with [`emergence_string_free`].
@@ -318,7 +469,8 @@ namespace Emergence.Native
     }
 
     /// <summary>
-    ///  Opaque handle to a simulation world.
+    ///  Opaque handle to a simulation world, with the last detailed error message (see
+    ///  [`emergence_world_last_error`]).
     /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     internal unsafe partial struct EmergenceWorld
@@ -388,7 +540,7 @@ namespace Emergence.Native
         /// </summary>
         WouldCreateCycle = 7,
         /// <summary>
-        ///  The root node cannot be given a parent.
+        ///  The root node cannot be moved or removed.
         /// </summary>
         IsRoot = 8,
         /// <summary>
@@ -433,6 +585,15 @@ namespace Emergence.Native
         ///  running away. Pause and read [`emergence_world_fuse_report_json`].
         /// </summary>
         FuseTripped = 18,
+        /// <summary>
+        ///  No template has that name.
+        /// </summary>
+        UnknownTemplate = 19,
+        /// <summary>
+        ///  A template spec is not valid JSON or does not make sense for that template. See
+        ///  [`emergence_world_last_error`] for why.
+        /// </summary>
+        InvalidSpec = 20,
         /// <summary>
         ///  The operation failed for a reason this ABI version does not have a code for.
         /// </summary>

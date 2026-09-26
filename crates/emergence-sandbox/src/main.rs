@@ -5,6 +5,7 @@
 //! first.
 
 mod activity;
+mod add_node;
 mod capture;
 mod control;
 mod graph_view;
@@ -140,6 +141,7 @@ struct SandboxApp {
     /// Why the control port is not available, if it is not.
     control_problem: Option<String>,
     deferred: remote::Deferred,
+    add_window: add_node::AddNodeWindow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +182,7 @@ impl SandboxApp {
             control: None,
             control_problem: None,
             deferred: remote::Deferred::default(),
+            add_window: add_node::AddNodeWindow::default(),
         };
         let port = std::env::var("EMERGENCE_CONTROL_PORT")
             .ok()
@@ -223,6 +226,11 @@ impl SandboxApp {
         app.build();
         if options.play {
             app.clock.playing = true;
+        }
+        if options.add_window
+            && let Ok(library) = &app.library
+        {
+            app.add_window.open(library.templates());
         }
         if let (Some(name), Ok(loaded)) = (&options.open, &app.loaded) {
             app.scope = loaded.snapshot.find_node(name).or(app.scope);
@@ -527,6 +535,7 @@ impl SandboxApp {
         let mut clicked = None;
         let mut enter = None;
         let mut command = None;
+        let mut remove = None;
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| match self.selection {
@@ -557,6 +566,16 @@ impl SandboxApp {
                     if !node.children.is_empty() && ui.button("Open ⏵").clicked() {
                         enter = Some(id);
                     }
+                    if id != snap.root()
+                        && ui
+                            .button("Remove")
+                            .on_hover_text(
+                                "Delete this node, everything inside it, and the links they own",
+                            )
+                            .clicked()
+                    {
+                        remove = Some(id);
+                    }
                     ui.add_space(8.0);
                     ui.strong("Logic");
                     let current = node.logic.clone().unwrap_or_else(|| "none".into());
@@ -579,10 +598,7 @@ impl SandboxApp {
                     if chosen != current {
                         command = Some(Command::SetLogic(id, chosen));
                     }
-                    ui.label(format!(
-                        "↑ {} sent   ↓ {} received",
-                        node.sent, node.received
-                    ));
+                    ui.label(format!("sent {}   received {}", node.sent, node.received));
 
                     let usable: Vec<String> = node
                         .subscriptions
@@ -645,6 +661,11 @@ impl SandboxApp {
         if let Some(command) = command {
             self.run_command(&command);
         }
+        if let Some(node) = remove
+            && let Err(e) = self.remove_node(node)
+        {
+            self.sim_error = Some(e);
+        }
     }
 
     fn traffic_log(&mut self, ui: &mut egui::Ui) {
@@ -682,6 +703,83 @@ impl SandboxApp {
                     ui.add(egui::Label::new(text).truncate());
                 }
             });
+    }
+
+    fn add_window_ui(&mut self, ctx: &egui::Context) {
+        let (Ok(library), Ok(loaded), Some(scope)) = (&self.library, &self.loaded, self.scope)
+        else {
+            return;
+        };
+        let library = library.clone();
+        let request = self
+            .add_window
+            .ui(ctx, library.templates(), &loaded.snapshot, scope);
+        if let Some(request) = request {
+            let result = self.add_node(&request);
+            self.add_window.finished(result);
+        }
+    }
+
+    /// Adds a node from a template, as one step: it is built and connected, or, if anything
+    /// fails, the world is left exactly as it was (including any new link made for it).
+    fn add_node(&mut self, req: &add_node::AddRequest) -> Result<String, String> {
+        use add_node::LinkTarget;
+        let Ok(loaded) = &mut self.loaded else {
+            return Err("nothing is loaded".into());
+        };
+        let world = &mut loaded.world;
+        let (link, made_link) = match &req.link {
+            LinkTarget::None => (None, false),
+            LinkTarget::Existing(l) => (Some(*l), false),
+            LinkTarget::New(name) => (
+                Some(world.create_link(name).map_err(|e| e.to_string())?),
+                true,
+            ),
+        };
+        let built =
+            world.build_template_at(&req.template, &req.name, &req.spec_json, req.parent, link);
+        let root = match built {
+            Ok(root) => root,
+            Err(e) => {
+                // Undo the link made for this add, so the whole step leaves no trace.
+                if let (true, Some(l)) = (made_link, link) {
+                    let _ = world.remove_link(l);
+                }
+                return Err(e.to_string());
+            }
+        };
+        loaded.snapshot = loaded.world.snapshot().map_err(|e| e.to_string())?;
+        let place = link.map_or_else(String::new, |l| {
+            format!(" on {}", loaded.snapshot.link_name(l))
+        });
+        self.select(Some(Item::Node(root)), Source::Canvas);
+        Ok(format!("added {} ({}){place}", req.name, req.template))
+    }
+
+    /// Deletes a node and everything inside it.
+    fn remove_node(&mut self, node: NodeId) -> Result<String, String> {
+        let Ok(loaded) = &mut self.loaded else {
+            return Err("nothing is loaded".into());
+        };
+        let name = loaded.snapshot.node_name(node).to_owned();
+        let inside = loaded.snapshot.descendant_count(node);
+        loaded.world.remove_node(node).map_err(|e| e.to_string())?;
+        loaded.snapshot = loaded.world.snapshot().map_err(|e| e.to_string())?;
+        if self.selection == Some(Item::Node(node)) {
+            self.selection = None;
+        }
+        // If the level being viewed was inside it, go back to the world.
+        if self
+            .scope
+            .is_some_and(|s| loaded.snapshot.node(s).is_none())
+        {
+            self.scope = Some(loaded.snapshot.root());
+        }
+        Ok(if inside > 0 {
+            format!("removed {name} and the {inside} nodes inside it")
+        } else {
+            format!("removed {name}")
+        })
     }
 
     /// Lets you try different fuse limits against the running network.
@@ -881,6 +979,14 @@ impl SandboxApp {
                 if ui.button("Re-layout").clicked() {
                     self.graph.relayout(scope);
                 }
+                if ui
+                    .button("+ Add node")
+                    .on_hover_text("Add a node from the templates library to this level")
+                    .clicked()
+                    && let Ok(library) = &self.library
+                {
+                    self.add_window.open(library.templates());
+                }
                 if ui.button("Fit").clicked() {
                     self.graph.fit(scope);
                 }
@@ -1003,6 +1109,7 @@ impl eframe::App for SandboxApp {
                 }
             });
         self.limits_window(ctx);
+        self.add_window_ui(ctx);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {

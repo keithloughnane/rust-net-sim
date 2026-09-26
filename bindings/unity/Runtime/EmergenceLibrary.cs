@@ -19,6 +19,9 @@ namespace Emergence
         /// <summary>Names of the built-in logic kinds, as a JSON array of strings.</summary>
         public static unsafe string LogicKindsJson => FromUtf8(NativeMethods.emergence_logic_kinds_json());
 
+        /// <summary>The templates, app catalogue, hardware tags and default specs, as JSON.</summary>
+        public static unsafe string TemplatesCatalogJson => FromUtf8(NativeMethods.emergence_templates_catalog_json());
+
         private static bool _checked;
 
         /// <summary>
@@ -43,6 +46,15 @@ namespace Emergence
             if (status == EmergenceStatus.Ok) return;
             var message = FromUtf8(NativeMethods.emergence_status_message((uint)status));
             throw new EmergenceException(status.ToString(), message);
+        }
+
+        /// <summary>A status a result type has no case for: a bug in the caller or the library.</summary>
+        internal static unsafe EmergenceException Unexpected(EmergenceStatus status, string reason)
+        {
+            var message = reason.Length > 0
+                ? reason
+                : FromUtf8(NativeMethods.emergence_status_message((uint)status));
+            return new EmergenceException(status.ToString(), message);
         }
 
         internal static unsafe string FromUtf8(byte* utf8) =>

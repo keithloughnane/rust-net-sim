@@ -35,6 +35,8 @@ pub(crate) struct Options {
     pub(crate) run_tests: bool,
     /// Frames to wait before taking the screenshot.
     pub(crate) frames: Option<u32>,
+    /// Start with the "Add node" window open.
+    pub(crate) add_window: bool,
 }
 
 impl Options {
@@ -50,6 +52,7 @@ impl Options {
             play: std::env::var_os("EMERGENCE_PLAY").is_some(),
             tab: std::env::var("EMERGENCE_TAB").ok(),
             run_tests: std::env::var_os("EMERGENCE_RUN_TESTS").is_some(),
+            add_window: std::env::var_os("EMERGENCE_ADD_WINDOW").is_some(),
             frames: std::env::var("EMERGENCE_SCREENSHOT_FRAMES")
                 .ok()
                 .and_then(|s| s.parse().ok()),

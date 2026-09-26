@@ -34,6 +34,8 @@ const INVALID_NAME: u32 = 14;
 const NAME_CONFLICT: u32 = 15;
 const QUEUE_FULL: u32 = 16;
 const PAYLOAD_TOO_LARGE: u32 = 17;
+const UNKNOWN_TEMPLATE: u32 = 19;
+const INVALID_SPEC: u32 = 20;
 
 /// One stress test.
 #[derive(Debug, Clone, Copy)]
@@ -1109,6 +1111,348 @@ pub(crate) const ALL: &[StressTest] = &[
                 format!("y received {y}"),
             );
             p.expect_no_alerts();
+            Ok(())
+        },
+    },
+    // The templates library.
+    StressTest {
+        group: "Templates",
+        name: "Template computer end to end",
+        description: "A computer from the templates library, on the Wi-Fi. A ping to an app inside it is routed in by its kernel and the pong comes back out.",
+        setup: |b| {
+            let wifi = b.world_link("wifi")?;
+            let laptop = b.device(b.root, "laptop", "computer", &[wifi], "responder")?;
+            b.computer(b.root, "pc", &[wifi], &["fileman"])?;
+            b.world
+                .send(laptop, "wifi", "pc@wifi/fileman@ipc", "ping", b"")
+        },
+        verify: |p| {
+            p.run(5)?;
+            let got = p.received("laptop")?;
+            p.check(
+                "the pong came back out",
+                got == 1,
+                format!("laptop received {got}"),
+            );
+            let snap = p.snapshot()?;
+            let services = [
+                "login-manager",
+                "registry",
+                "desktop",
+                "hid-serv",
+                "drive-bay",
+            ]
+            .iter()
+            .filter(|s| snap.find_node(s).is_some())
+            .count();
+            p.check(
+                "all five system services are inside",
+                services == 5,
+                format!("{services} of 5"),
+            );
+            p.expect_no_alerts();
+            Ok(())
+        },
+    },
+    StressTest {
+        group: "Templates",
+        name: "Promiscuous NIC overhears",
+        description: "A computer built with a promiscuous network card hears traffic between two other devices on its link, without it being addressed to it.",
+        setup: |b| {
+            let wifi = b.world_link("wifi")?;
+            let spec = r#"{"hardware":["promiscuous-nic"]}"#;
+            let sniffer = b.world.build_template("computer", "sniffer", spec)?;
+            b.world.connect(b.root, sniffer, Some(wifi))?;
+            let a = b.device(b.root, "alice", "device", &[wifi], "none")?;
+            b.device(b.root, "bob", "device", &[wifi], "none")?;
+            for _ in 0..10 {
+                b.world.send(a, "wifi", "bob@wifi", "secret", b"")?;
+            }
+            Ok(())
+        },
+        verify: |p| {
+            p.run(2)?;
+            let (sniffed, bob) = (p.received("sniffer")?, p.received("bob")?);
+            p.check("bob got his 10 packets", bob == 10, format!("{bob}"));
+            p.check(
+                "the sniffer overheard all 10",
+                sniffed == 10,
+                format!("{sniffed}"),
+            );
+            let noted = p.notes.iter().any(|n| n.contains("sniffed"));
+            p.check(
+                "the kernel notes what it sniffed",
+                noted,
+                format!("{} notes", p.notes.len()),
+            );
+            Ok(())
+        },
+    },
+    StressTest {
+        group: "Templates",
+        name: "Guard NPC",
+        description: "A guard from the NPC template follows its schedule, answers when talked to, and raises the alarm when told it has seen the player.",
+        setup: |b| {
+            let hall = b.world_link("hall")?;
+            let spec = serde_json::json!({
+                "role": "guard",
+                "day_length": 20,
+                "schedule": [[0, "patrol"], [10, "rest"]],
+                "lines": ["Halt!"],
+            });
+            b.npc("guard", &[hall], &spec)?;
+            let player = b.device(b.root, "player", "player", &[hall], "none")?;
+            b.world.send(player, "hall", "guard@hall", "talk", b"")?;
+            b.world
+                .send(player, "hall", "guard@hall", "player-seen", b"")
+        },
+        verify: |p| {
+            p.run(12)?;
+            let goals = ["goal: patrol", "goal: rest"]
+                .iter()
+                .filter(|g| p.notes.iter().any(|n| n == *g))
+                .count();
+            p.check(
+                "followed its schedule",
+                goals == 2,
+                format!("{goals} of 2 goals"),
+            );
+            p.check(
+                "raised the alarm",
+                p.notes.iter().any(|n| n.contains("alarm")),
+                format!("{} notes", p.notes.len()),
+            );
+            let got = p.received("player")?;
+            p.check(
+                "the player heard a line, the alarm and goal changes",
+                got >= 3,
+                format!("{got} packets"),
+            );
+            p.expect_no_alerts();
+            Ok(())
+        },
+    },
+    StressTest {
+        group: "Templates",
+        name: "Civilian NPC flees",
+        description: "A civilian from the NPC template drops its schedule and flees when it sees the player.",
+        setup: |b| {
+            let street = b.world_link("street")?;
+            b.npc(
+                "shopper",
+                &[street],
+                &serde_json::json!({ "role": "civilian" }),
+            )?;
+            let player = b.device(b.root, "player", "player", &[street], "none")?;
+            b.world
+                .send(player, "street", "shopper@street", "player-seen", b"")
+        },
+        verify: |p| {
+            p.run(3)?;
+            let fled = p.notes.iter().any(|n| n == "goal: flee");
+            p.check("switched its goal to flee", fled, format!("{:?}", p.notes));
+            Ok(())
+        },
+    },
+    StressTest {
+        group: "Templates",
+        name: "Bad template specs",
+        description: "An app that is not in the catalogue, an app installed twice, a nonsense NPC schedule, an unknown template, and a computer named after one of its own services are all refused, with a reason, and build nothing.",
+        setup: none,
+        verify: |p| {
+            let before = p.snapshot()?.node_count();
+            let cases: [(&str, &str, &str, u32); 5] = [
+                (
+                    "unknown app",
+                    "computer",
+                    r#"{"apps":["doom"]}"#,
+                    INVALID_SPEC,
+                ),
+                (
+                    "app twice",
+                    "computer",
+                    r#"{"apps":["mail","mail"]}"#,
+                    INVALID_SPEC,
+                ),
+                (
+                    "schedule not starting at 0",
+                    "npc",
+                    r#"{"schedule":[[5,"work"]]}"#,
+                    INVALID_SPEC,
+                ),
+                ("unknown template", "toaster", "", UNKNOWN_TEMPLATE),
+                ("named after a service", "computer", "", INVALID_SPEC),
+            ];
+            for (label, template, spec, code) in cases {
+                let name = if label == "named after a service" {
+                    "registry"
+                } else {
+                    "thing"
+                };
+                let result = p.world.build_template(template, name, spec);
+                p.expect_status(&format!("{label} refused"), result, code);
+            }
+            let after = p.snapshot()?.node_count();
+            p.check(
+                "nothing was built",
+                before == after,
+                format!("{before} → {after} nodes"),
+            );
+            Ok(())
+        },
+    },
+    StressTest {
+        group: "Templates",
+        name: "Added to a live network",
+        description: "While the Office runs, a new computer from the template is plugged into the Wi-Fi. It starts answering the router's beacons, and nothing else is disturbed.",
+        setup: |b| scenario("Office")(b),
+        verify: |p| {
+            p.run(50)?;
+            let (root, wifi) = (p.world.root()?, p.link("office-wifi")?);
+            let pc = p
+                .world
+                .build_template("computer", "pc-new", r#"{"apps":["mail"]}"#)?;
+            p.world.connect(root, pc, Some(wifi))?;
+            p.run(60)?;
+            let got = p.received("pc-new")?;
+            p.check(
+                "the new computer takes part",
+                got > 0,
+                format!("received {got}"),
+            );
+            p.expect_no_fuse();
+            p.expect_no_alerts();
+            Ok(())
+        },
+    },
+    // Every step either happens completely or leaves the world as it was.
+    StressTest {
+        group: "Atomic steps & removal",
+        name: "One-step add that fails leaves nothing",
+        description: "Building a second `pc-manager` on the Office Wi-Fi in one step (build and connect) is refused, and not a single node or link is left behind.",
+        setup: |b| scenario("Office")(b),
+        verify: |p| {
+            p.run(20)?;
+            let before = p.snapshot()?;
+            let (nodes, links) = (before.node_count(), before.link_count());
+            let (root, wifi) = (p.world.root()?, p.link("office-wifi")?);
+            let result = p
+                .world
+                .build_template_at("computer", "pc-manager", "", root, Some(wifi));
+            p.expect_status("refused with NameConflict", result, NAME_CONFLICT);
+            let after = p.snapshot()?;
+            p.check(
+                "world unchanged",
+                after.node_count() == nodes && after.link_count() == links,
+                format!(
+                    "{nodes} → {} nodes, {links} → {} links",
+                    after.node_count(),
+                    after.link_count()
+                ),
+            );
+            p.run(50)?;
+            p.expect_no_fuse();
+            p.expect_no_alerts();
+            Ok(())
+        },
+    },
+    StressTest {
+        group: "Atomic steps & removal",
+        name: "Two-step add: connect fails, node stays",
+        description: "Building a second `pc-manager` succeeds (step one); connecting it to the Wi-Fi is refused (step two), so it stays built but detached, and the running network is untouched.",
+        setup: |b| scenario("Office")(b),
+        verify: |p| {
+            p.run(20)?;
+            let nodes = p.snapshot()?.node_count();
+            let (root, wifi) = (p.world.root()?, p.link("office-wifi")?);
+            let dup = p.world.build_template("computer", "pc-manager", "")?;
+            let result = p.world.connect(root, dup, Some(wifi));
+            p.expect_status("connect refused with NameConflict", result, NAME_CONFLICT);
+            let snap = p.snapshot()?;
+            let still_built = snap.node(dup).is_some_and(|n| n.parent.is_none());
+            p.check(
+                "built and detached",
+                still_built,
+                format!("{nodes} → {} nodes", snap.node_count()),
+            );
+            p.world.remove_node(dup)?;
+            let back = p.snapshot()?.node_count();
+            p.check(
+                "removing it restores the world",
+                back == nodes,
+                format!("{back} nodes"),
+            );
+            p.run(50)?;
+            p.expect_no_fuse();
+            p.expect_no_alerts();
+            Ok(())
+        },
+    },
+    StressTest {
+        group: "Atomic steps & removal",
+        name: "Remove a computer mid-traffic",
+        description: "While its scanner is busy, `pc-manager` is removed with everything inside it. Its queued packets are dropped, nothing else notices, and it is gone completely.",
+        setup: |b| scenario("Office")(b),
+        verify: |p| {
+            p.run(37)?;
+            let pc = p.node("pc-manager")?;
+            let before = p.snapshot()?;
+            let inside = before.descendant_count(pc);
+            p.world.remove_node(pc)?;
+            let after = p.snapshot()?;
+            p.check(
+                "the computer and its insides are gone",
+                after.node_count() == before.node_count() - inside - 1
+                    && after.find_node("pc-manager").is_none(),
+                format!("{} → {} nodes", before.node_count(), after.node_count()),
+            );
+            p.run(80)?;
+            p.expect_no_fuse();
+            p.expect_no_alerts();
+            Ok(())
+        },
+    },
+    StressTest {
+        group: "Atomic steps & removal",
+        name: "Remove a link mid-traffic",
+        description: "The Office Wi-Fi is removed while the router beacons across it. Everything on it stays but loses the link; traffic carries on elsewhere.",
+        setup: |b| scenario("Office")(b),
+        verify: |p| {
+            p.run(30)?;
+            let wifi = p.link("office-wifi")?;
+            p.world.remove_link(wifi)?;
+            let snap = p.snapshot()?;
+            let kept = ["router", "laptop", "pc-manager"]
+                .iter()
+                .all(|n| snap.find_node(n).is_some());
+            p.check("the nodes stay", kept, "router, laptop, pc-manager");
+            p.check(
+                "the link is gone",
+                snap.find_link("office-wifi").is_none(),
+                "",
+            );
+            p.run(80)?;
+            p.expect_no_fuse();
+            p.expect_no_alerts();
+            let t = p.ticks;
+            p.check("the world kept ticking", t == 110, format!("{t} ticks"));
+            Ok(())
+        },
+    },
+    StressTest {
+        group: "Atomic steps & removal",
+        name: "Removing the bridges ends a storm",
+        description: "A three-bridge storm is building; the bridges are deleted outright. Traffic dies without the fuse tripping.",
+        setup: |b| bridged(b, 3),
+        verify: |p| {
+            p.run(6)?;
+            for i in 0..3 {
+                let bridge = p.node(&format!("bridge-{i}"))?;
+                p.world.remove_node(bridge)?;
+            }
+            p.run(10)?;
+            p.expect_no_fuse();
+            p.expect_quiet();
             Ok(())
         },
     },

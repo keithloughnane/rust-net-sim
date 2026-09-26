@@ -52,7 +52,6 @@ pub enum Relaying {
 
 /// Why a node accepted a packet (see the routing rules in the design docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum AcceptRule {
     /// Addressed to this node by name.
     Addressed,
@@ -64,11 +63,13 @@ pub enum AcceptRule {
     Gateway,
     /// Accepted because the node's logic asked for it ([`ControllerLogic::wants`]).
     Forced,
+    /// Handed to a host node, whose host applies its own accept rules
+    /// ([`World::set_host`](crate::World::set_host)).
+    Host,
 }
 
 /// Why a send was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum SendError {
     /// The sending node does not exist.
     UnknownNode(NodeId),

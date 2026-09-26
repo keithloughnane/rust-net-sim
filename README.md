@@ -27,6 +27,75 @@ used from Unity (C#), Unreal (C++) or any other engine.
   every `on_tick`, then delivers everything queued before it. Replies wait for the next tick, so
   packets move one hop per tick, the same inputs always give the same result, and a tick
   always finishes. `drain_trace()` reports what happened (sent, delivered, dropped, notes).
+- **Host nodes**: nodes whose behaviour lives in the host (a game's own C# logic, say) instead of a
+  `ControllerLogic`. `set_host(node, true)` hands every packet on the node's links to the host,
+  whatever the accept rules say; the host collects them after each tick with
+  `drain_host_deliveries()` and applies its own rules. It sends with `send_packet`, choosing the
+  routes and event itself, so it can reply and forward. TTL is the library's loop protection: a
+  host sends fresh packets without one (0 over the C ABI, `null` in C#) and passes a delivered
+  packet's TTL on when it forwards it, so loops through host nodes still run out. Over the C ABI:
+  `emergence_world_set_host`, `emergence_world_host_send` and
+  `emergence_world_drain_host_deliveries_json`; in C#: `World.SetHost`, `World.HostSend` and
+  `World.DrainHostDeliveries`. This is how a game keeps its own behaviour while Emergence carries
+  the traffic: topology, links, ticking, TTL, the monitor and the fuse. When the host must deliver
+  something immediately, `push_direct` (`emergence_world_host_push`, `World.HostPush`) hands a
+  packet straight to a node with no link or tick; it still spends a hop, is counted
+  (`direct_pushes` in the health report), traced as `pushed` and watched by the monitor.
+
+### Results at the boundary
+
+Every call either succeeds or leaves the world exactly as it was. Results are closed sets of
+cases, like a Kotlin `sealed interface`, so a caller knows every case is handled:
+
+- **Rust**: `Result<T, E>` where `E` is an exhaustive enum whose cases carry data
+  (`NetworkError::NameConflict { node, with }`, `TemplateError::AppInstalledTwice(app)`,
+  `TemplateError::Npc(NpcSpecProblem::ScheduleOutOfOrder)`, …). No public enum is
+  `#[non_exhaustive]`, so `match` has to cover every case and a new case is a compile error until
+  it does.
+- **C**: a status code (`EmergenceStatus`) per call, plus `emergence_world_last_error` for detail.
+- **C# / Unity**: sealed result classes per call (`BuildResult`, `BuildAtResult`,
+  `ConnectResult`, `RemoveResult`), each with a `Match(...)` that takes one handler per case, so
+  the compiler insists every case is handled. Exceptions are only for bugs in the calling code
+  (a disposed world, an internal error).
+
+  ```csharp
+  var result = world.BuildComputerAt("pc-9", world.Root, wifi, new[] { "fileman" });
+  var message = result.Match(
+      added: r => $"added {r.Root}",
+      invalidName: r => r.Reason,
+      invalidSpec: r => r.Reason,
+      unknownTemplate: r => r.Reason,
+      nameConflict: r => r.Reason,
+      cannotPlace: r => r.Reason);
+  ```
+
+Adding a node from a template can be **two steps** (`build_*`, then `connect`: if the connect
+fails the node stays built but detached) or **one step** (`build_*_at`: if anything fails, nothing
+is added). Nodes and links can be removed (`remove_node` takes everything inside with it).
+
+### Templates (`emergence-templates`)
+
+A separate library of pre-built composite nodes, following the node-templates design docs: one
+builder per kind of thing, each with its own parameters, each returning a complete, detached
+subtree for the caller to connect wherever it belongs. Callers get the root and use it like any
+node; what's inside can grow without breaking them.
+
+- **`build_computer(world, name, ComputerSpec { apps, hardware })`**: a `kernel` root (the
+  computer's gateway) with an `ipc` bus, the five system services every computer has
+  (`login-manager`, `registry`, `desktop`, `hid-serv`, `drive-bay`) and one node per installed app.
+  Apps come from a fixed catalogue (`AppKind`: `fileman`, `net-scan`, `mail`, `crypt-cracker`, …).
+  Hardware tags: `wifi`, `modem`, `promiscuous-nic`. Today only `promiscuous-nic` changes
+  behaviour: the kernel overhears all traffic on its links.
+- **`build_npc(world, name, NpcSpec { role, day_length, schedule, lines })`**: the MVP from the
+  docs, one node with a schedule (it broadcasts `goal` changes for the host to act on), dialogue
+  (`talk` → `say`), and a reaction to `player-seen`: guards raise the `alarm`, civilians `flee`.
+  Detecting the player is the host's job; reacting is the NPC's.
+
+Over the C ABI: `emergence_templates_catalog_json()` describes everything (templates, apps,
+hardware, roles, default specs) and `emergence_template_build(world, "computer", name, spec_json,
+&root)` builds one; `emergence_world_last_error` explains a rejected spec. The C# wrapper has
+`BuildTemplate` and `BuildComputer`. The demo scenarios build their computers and NPCs from the
+templates.
 
 ### Safety: monitor and fuse
 
@@ -73,6 +142,7 @@ Deliberate differences from the SmitherNet design docs:
 | Path | Purpose |
 |---|---|
 | `crates/emergence-engine` | The engine itself. Pure Rust, no UI, no unsafe code. |
+| `crates/emergence-templates` | Pre-built composite nodes (computers, NPCs). Depends only on the engine. |
 | `crates/emergence-ffi` | C ABI over the engine. Builds `libemergence` (`.dylib`/`.dll`/`.so` and a static lib). |
 | `crates/emergence-sandbox` | Desktop test UI (egui). Loads the compiled `libemergence` at runtime, exactly like a game engine would. |
 | `bindings/c/emergence.h` | Generated C/C++ header (Unreal, custom engines). |
@@ -91,7 +161,7 @@ cargo doc --open            # API docs
 cargo sandbox               # build the native library and run the test UI against it
 cargo xtask bindings        # regenerate the C header and C# bindings after changing the ABI
 cargo xtask test-csharp     # run the C# bindings against the native library (needs dotnet)
-cargo xtask dist            # package a release build into dist/
+cargo xtask dist            # package release builds for every platform into dist/ (--host: this one only)
 
 cargo fmt --all             # format
 cargo check-all             # clippy on everything, warnings as errors
@@ -119,6 +189,10 @@ time:
 - **Tests** (bottom tab): the stress-test checklist. Run one test or all of them on a background
   thread and see every check pass or fail. *Watch* loads a test's network into the viewer,
   paused, so you can step through exactly what it does.
+- **Add node** (above the canvas): build a node from the templates library and plug it into the
+  level you are viewing, on one of its links or a new one. It is one step: if it fails, nothing
+  is added (not even the new link). Custom nodes will come later. **Remove** in the inspector
+  deletes a node and everything inside it.
 - **Controls**: play/pause (Space), step one tick, and speed. The inspector can change a node's
   logic and send events from it: one click pings everyone on a link, or fill in a route such
   as `pc-manager@office-wifi/fileman@ipc`.
@@ -150,6 +224,10 @@ cargo ctl log 10                        # the last traffic lines
 cargo ctl watch four bridges            # load a stress test's network, paused
 cargo ctl step 20                       # stops early, and explains, if the fuse trips
 cargo ctl run                           # run the whole checklist and print the results
+cargo ctl templates                     # what the templates library can build
+cargo ctl add computer pc-lab --link office-wifi --apps fileman,net-scan --hardware promiscuous-nic
+cargo ctl add npc bob --link office-lan --role guard --say "Halt!|Move along."
+cargo ctl remove pc-lab
 cargo ctl screenshot window.png         # save a picture of the window
 cargo ctl help                          # every command
 ```
@@ -173,6 +251,7 @@ Environment variables for scripted runs:
 | `EMERGENCE_TAB` | Start on the `traffic`, `alerts` or `tests` tab. |
 | `EMERGENCE_RUN_TESTS` | Run the whole stress-test checklist at startup. |
 | `EMERGENCE_SCREENSHOT_FRAMES` | Frames to wait before the screenshot (default 150). |
+| `EMERGENCE_ADD_WINDOW` | Start with the Add node window open. |
 | `EMERGENCE_SCREENSHOT` | Save a PNG of the window once the layout settles, then quit. |
 
 ## Using the library
@@ -202,9 +281,28 @@ Environment variables for scripted runs:
    Debug.Log(world.DrainTraceJson());
    ```
 
-`dist` only contains the native library for the machine that built it. Other platforms need their
-own build (or cross-compilation) added to `Runtime/Plugins/`. On iOS the bindings automatically
-switch to the statically linked `__Internal` library.
+`dist` builds the native library for every desktop platform, each in its own folder under
+`Runtime/Plugins/` with a `.meta` that makes it a native plugin for its own editor and player only:
+
+| Folder | Library | Built for |
+|---|---|---|
+| `macos` | `libemergence.dylib` | macOS, universal (Apple silicon and Intel) |
+| `linux-x86_64` | `libemergence.so` | Linux x86-64, glibc 2.17 or newer |
+| `windows-x86_64` | `emergence.dll` | Windows x86-64 (only needs the Universal C Runtime of Windows 10+) |
+
+Linux and Windows are cross-compiled with [zig](https://ziglang.org):
+
+```sh
+brew install zig
+cargo install cargo-zigbuild
+rustup target add x86_64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-gnu
+```
+
+`cargo xtask dist --host` skips cross-compiling and packages only the machine you are on. The
+`.meta` GUIDs are fixed, so copying a new `dist` over a project's copy of the package keeps its
+references. Unity never reloads a native library while it runs: restart the editor after
+replacing one. On iOS the bindings automatically switch to the statically linked `__Internal`
+library.
 
 ### Unreal / C++
 

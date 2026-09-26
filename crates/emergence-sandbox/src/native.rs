@@ -20,7 +20,7 @@ use crate::snapshot::{Snapshot, SnapshotError};
 use crate::trace::TraceEntry;
 
 /// ABI version this module was written against (`EMERGENCE_ABI_VERSION` in the header).
-const EXPECTED_ABI_VERSION: u32 = 4;
+const EXPECTED_ABI_VERSION: u32 = 8;
 
 /// Environment variable that overrides where the library is loaded from.
 const LIB_PATH_VAR: &str = "EMERGENCE_LIB";
@@ -37,6 +37,28 @@ pub(crate) enum TickResult {
     Completed,
     /// The world hit a hard limit and held packets back. The host should pause.
     FuseTripped,
+}
+
+/// The template catalogue (see `emergence_templates_catalog_json`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct TemplateCatalog {
+    pub(crate) templates: Vec<TemplateInfo>,
+    pub(crate) apps: Vec<AppInfo>,
+    pub(crate) hardware: Vec<String>,
+    pub(crate) npc_roles: Vec<String>,
+    pub(crate) defaults: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TemplateInfo {
+    pub(crate) name: String,
+    pub(crate) description: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct AppInfo {
+    pub(crate) name: String,
+    pub(crate) title: String,
 }
 
 /// A built-in logic kind offered by the library.
@@ -181,6 +203,26 @@ struct Api {
     set_trace_packets: unsafe extern "C" fn(*mut RawWorld, u32) -> Status,
     health_json: unsafe extern "C" fn(*mut RawWorld, *mut *mut c_char) -> Status,
     fuse_report_json: unsafe extern "C" fn(*mut RawWorld, *mut *mut c_char) -> Status,
+    template_build: unsafe extern "C" fn(
+        *mut RawWorld,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        *mut NodeId,
+    ) -> Status,
+    last_error: unsafe extern "C" fn(*const RawWorld) -> *const c_char,
+    #[allow(clippy::type_complexity)] // Mirrors the C declaration one to one.
+    template_build_at: unsafe extern "C" fn(
+        *mut RawWorld,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        NodeId,
+        LinkId,
+        *mut NodeId,
+    ) -> Status,
+    remove_node: unsafe extern "C" fn(*mut RawWorld, NodeId) -> Status,
+    remove_link: unsafe extern "C" fn(*mut RawWorld, LinkId) -> Status,
 }
 
 /// The loaded native library and the function pointers resolved from it.
@@ -188,6 +230,7 @@ pub(crate) struct NativeLibrary {
     path: PathBuf,
     version: String,
     logic_kinds: Vec<LogicKind>,
+    templates: TemplateCatalog,
     api: Api,
     // Declared last so it is dropped (unloaded) after nothing else can use the pointers above.
     _library: Library,
@@ -222,6 +265,7 @@ impl NativeLibrary {
     }
 
     /// Loads the library at `path`, resolves every symbol, and checks the ABI version.
+    #[allow(clippy::too_many_lines)] // One entry per exported symbol.
     pub(crate) fn load(path: &Path) -> Result<Arc<Self>, NativeError> {
         let load_err = |source| NativeError::Load {
             path: path.to_path_buf(),
@@ -300,7 +344,28 @@ impl NativeLibrary {
                 fuse_report_json: *library
                     .get(b"emergence_world_fuse_report_json\0")
                     .map_err(load_err)?,
+                template_build: *library
+                    .get(b"emergence_template_build\0")
+                    .map_err(load_err)?,
+                last_error: *library
+                    .get(b"emergence_world_last_error\0")
+                    .map_err(load_err)?,
+                template_build_at: *library
+                    .get(b"emergence_template_build_at\0")
+                    .map_err(load_err)?,
+                remove_node: *library
+                    .get(b"emergence_network_remove_node\0")
+                    .map_err(load_err)?,
+                remove_link: *library
+                    .get(b"emergence_network_remove_link\0")
+                    .map_err(load_err)?,
             };
+            let catalog = *library
+                .get::<extern "C" fn() -> *const c_char>(b"emergence_templates_catalog_json\0")
+                .map_err(load_err)?;
+            let templates: TemplateCatalog =
+                serde_json::from_slice(CStr::from_ptr(catalog()).to_bytes())
+                    .map_err(NativeError::Trace)?;
             let logic_kinds = *library
                 .get::<extern "C" fn() -> *const c_char>(b"emergence_logic_kinds_json\0")
                 .map_err(load_err)?;
@@ -312,6 +377,7 @@ impl NativeLibrary {
                 path: path.to_path_buf(),
                 version,
                 logic_kinds,
+                templates,
                 api,
                 _library: library,
             }))
@@ -324,6 +390,11 @@ impl NativeLibrary {
 
     pub(crate) fn version(&self) -> &str {
         &self.version
+    }
+
+    /// The templates the library can build.
+    pub(crate) fn templates(&self) -> &TemplateCatalog {
+        &self.templates
     }
 
     /// The built-in logic kinds the library offers.
@@ -437,6 +508,89 @@ impl NativeWorld {
             return Ok(TickResult::FuseTripped);
         }
         self.check(status).map(|()| TickResult::Completed)
+    }
+
+    /// Builds a detached node from a template (step one of two: connecting is separate, and if
+    /// it fails the node stays built). Errors carry the library's explanation.
+    pub(crate) fn build_template(
+        &mut self,
+        template: &str,
+        name: &str,
+        spec_json: &str,
+    ) -> Result<NodeId, NativeError> {
+        self.build(template, name, spec_json, None)
+    }
+
+    /// Builds a node from a template and connects it in one step. If it fails, nothing was
+    /// added.
+    pub(crate) fn build_template_at(
+        &mut self,
+        template: &str,
+        name: &str,
+        spec_json: &str,
+        parent: NodeId,
+        link: Option<LinkId>,
+    ) -> Result<NodeId, NativeError> {
+        self.build(
+            template,
+            name,
+            spec_json,
+            Some((parent, link.unwrap_or(LinkId::NONE))),
+        )
+    }
+
+    fn build(
+        &mut self,
+        template: &str,
+        name: &str,
+        spec_json: &str,
+        at: Option<(NodeId, LinkId)>,
+    ) -> Result<NodeId, NativeError> {
+        let (t, n, s) = (
+            CString::new(template)?,
+            CString::new(name)?,
+            CString::new(spec_json)?,
+        );
+        let mut id = NodeId { raw: 0 };
+        let (w, api) = (self.handle.as_ptr(), self.api());
+        let status = unsafe {
+            match at {
+                Some((parent, link)) => (api.template_build_at)(
+                    w,
+                    t.as_ptr(),
+                    n.as_ptr(),
+                    s.as_ptr(),
+                    parent,
+                    link,
+                    &raw mut id,
+                ),
+                None => (api.template_build)(w, t.as_ptr(), n.as_ptr(), s.as_ptr(), &raw mut id),
+            }
+        };
+        if status == STATUS_OK {
+            return Ok(id);
+        }
+        // The world keeps a detailed message for template failures.
+        let why = unsafe { CStr::from_ptr((api.last_error)(w)) };
+        let why = why.to_string_lossy();
+        match self.check(status) {
+            // The detailed message already says what kind of error it is.
+            Err(NativeError::Status { code, .. }) if !why.is_empty() => Err(NativeError::Status {
+                code,
+                message: why.into_owned(),
+            }),
+            other => other.map(|()| id),
+        }
+    }
+
+    /// Deletes a node, everything inside it, and the links they own.
+    pub(crate) fn remove_node(&mut self, node: NodeId) -> Result<(), NativeError> {
+        self.check(unsafe { (self.api().remove_node)(self.handle.as_ptr(), node) })
+    }
+
+    /// Deletes a link; its subscribers and owner stay.
+    pub(crate) fn remove_link(&mut self, link: LinkId) -> Result<(), NativeError> {
+        self.check(unsafe { (self.api().remove_link)(self.handle.as_ptr(), link) })
     }
 
     pub(crate) fn unsubscribe(&mut self, node: NodeId, link: LinkId) -> Result<(), NativeError> {

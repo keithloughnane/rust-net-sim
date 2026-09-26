@@ -39,6 +39,18 @@ enum Entry {
         link: u64,
         rule: &'static str,
     },
+    Pushed {
+        tick: u64,
+        packet: u64,
+        receiver: u64,
+        from: String,
+        to: String,
+        kind: String,
+        /// The payload as text, if it is valid UTF-8.
+        data: Option<String>,
+        data_len: usize,
+        ttl: u8,
+    },
     Dropped {
         tick: u64,
         packet: u64,
@@ -51,8 +63,6 @@ enum Entry {
         text: String,
     },
     Alert(crate::health::AlertJson),
-    /// An event kind this ABI version cannot describe.
-    Other,
 }
 
 fn rule_name(rule: AcceptRule) -> &'static str {
@@ -62,7 +72,7 @@ fn rule_name(rule: AcceptRule) -> &'static str {
         AcceptRule::ChildToParent => "child_to_parent",
         AcceptRule::Gateway => "gateway",
         AcceptRule::Forced => "forced",
-        _ => "other",
+        AcceptRule::Host => "host",
     }
 }
 
@@ -71,7 +81,6 @@ fn reason_name(reason: DropReason) -> &'static str {
         DropReason::TtlExpired => "ttl_expired",
         DropReason::NoRecipient => "no_recipient",
         DropReason::SenderLeftLink => "sender_left_link",
-        _ => "other",
     }
 }
 
@@ -90,6 +99,21 @@ impl Trace {
                     packet: packet.id().to_raw(),
                     sender: sender.to_raw(),
                     link: link.to_raw(),
+                    from: packet.from().to_string(),
+                    to: packet.to().to_string(),
+                    kind: packet.event().kind.clone(),
+                    data: String::from_utf8(packet.event().data.clone()).ok(),
+                    data_len: packet.event().data.len(),
+                    ttl: packet.ttl(),
+                },
+                TraceEvent::Pushed {
+                    tick,
+                    packet,
+                    receiver,
+                } => Entry::Pushed {
+                    tick,
+                    packet: packet.id().to_raw(),
+                    receiver: receiver.to_raw(),
                     from: packet.from().to_string(),
                     to: packet.to().to_string(),
                     kind: packet.event().kind.clone(),
@@ -127,7 +151,6 @@ impl Trace {
                     node: node.to_raw(),
                     text,
                 },
-                _ => Entry::Other,
             })
             .collect();
         Self {

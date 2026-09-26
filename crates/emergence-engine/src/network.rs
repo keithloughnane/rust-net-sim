@@ -92,7 +92,6 @@ impl Link {
 
 /// Why a [`Network`] operation was rejected. A rejected operation changes nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum NetworkError {
     /// The node handle does not refer to a node in this network.
     UnknownNode(NodeId),
@@ -135,7 +134,7 @@ impl fmt::Display for NetworkError {
             Self::UnknownLink(id) => write!(f, "unknown link {id:?}"),
             Self::AlreadyHasParent(id) => write!(f, "node {id:?} already has a parent"),
             Self::WouldCreateCycle => f.write_str("a node cannot be nested inside itself"),
-            Self::IsRoot => f.write_str("the root node cannot have a parent"),
+            Self::IsRoot => f.write_str("the root node cannot be moved or removed"),
             Self::LinkOwnedElsewhere(id) => {
                 write!(f, "link {id:?} is already internal to another node")
             }
@@ -481,6 +480,72 @@ impl Network {
         Ok(())
     }
 
+    /// Deletes `node` and everything nested inside it, with the links they own. Other nodes
+    /// subscribed to those links lose that subscription; the node leaves its parent and every
+    /// link it was on. Returns every node removed, `node` first.
+    ///
+    /// Handles to removed nodes and links never resolve again.
+    ///
+    /// # Errors
+    ///
+    /// Fails without changing anything if the node is unknown or is the root.
+    pub fn remove_node(&mut self, node: NodeId) -> Result<Vec<NodeId>, NetworkError> {
+        let parent = self.check_node(node)?.parent;
+        if node == self.root {
+            return Err(NetworkError::IsRoot);
+        }
+        // The whole subtree, iteratively so any depth is safe.
+        let mut doomed = vec![node];
+        let mut i = 0;
+        while let Some(&n) = doomed.get(i) {
+            doomed.extend(self.nodes[n].children.iter().copied());
+            i += 1;
+        }
+        if let Some(p) = parent {
+            self.nodes[p].children.retain(|&c| c != node);
+        }
+        for &n in &doomed {
+            for link in self.nodes[n].subscriptions.clone() {
+                if let Some(l) = self.links.get_mut(link) {
+                    l.subscribers.retain(|&s| s != n);
+                }
+            }
+            for link in self.nodes[n].internal_links.clone() {
+                self.drop_link(link);
+            }
+        }
+        for &n in &doomed {
+            self.nodes.remove(n);
+        }
+        Ok(doomed)
+    }
+
+    /// Deletes `link`. Its subscribers lose the subscription and its owner loses the internal
+    /// link; the nodes themselves stay.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the link is unknown.
+    pub fn remove_link(&mut self, link: LinkId) -> Result<(), NetworkError> {
+        self.check_link(link)?;
+        self.drop_link(link);
+        Ok(())
+    }
+
+    fn drop_link(&mut self, link: LinkId) {
+        let Some(l) = self.links.remove(link) else {
+            return;
+        };
+        for s in l.subscribers {
+            if let Some(n) = self.nodes.get_mut(s) {
+                n.subscriptions.retain(|&x| x != link);
+            }
+        }
+        if let Some(n) = l.owner.and_then(|o| self.nodes.get_mut(o)) {
+            n.internal_links.retain(|&x| x != link);
+        }
+    }
+
     /// Whether `node` can transmit on `link`: it subscribes to it or owns it.
     #[must_use]
     pub fn can_use_link(&self, node: NodeId, link: LinkId) -> bool {
@@ -676,6 +741,52 @@ mod tests {
         assert_ne!(node.to_raw(), 0);
         assert_eq!(NodeId::from_raw(node.to_raw()), node);
         assert!(net.node(NodeId::from_raw(0)).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn removing_a_node_takes_its_insides_and_their_links() -> TestResult {
+        let mut net = Network::new();
+        let root = net.root();
+        let wifi = net.create_link("wifi")?;
+        let pc = net.create_node("pc", "computer")?;
+        let laptop = net.create_node("laptop", "computer")?;
+        net.connect(root, pc, Some(wifi))?;
+        net.connect(root, laptop, Some(wifi))?;
+        let ipc = net.create_link("ipc")?;
+        let app = net.create_node("app", "app")?;
+        net.connect(pc, app, Some(ipc))?;
+        // A node outside the computer plugged into its bus.
+        net.subscribe(laptop, ipc)?;
+
+        let removed = net.remove_node(pc)?;
+        assert_eq!(removed, vec![pc, app]);
+        assert!(net.node(pc).is_none() && net.node(app).is_none() && net.link(ipc).is_none());
+        assert_eq!(
+            net.node(root).map(ControlNode::children),
+            Some(&[laptop][..])
+        );
+        assert_eq!(net.link(wifi).map(Link::subscribers), Some(&[laptop][..]));
+        assert_eq!(
+            net.node(laptop).map(ControlNode::subscriptions),
+            Some(&[wifi][..])
+        );
+        assert_eq!(net.remove_node(root), Err(NetworkError::IsRoot));
+        Ok(())
+    }
+
+    #[test]
+    fn removing_a_link_keeps_its_nodes() -> TestResult {
+        let mut net = Network::new();
+        let root = net.root();
+        let wifi = net.create_link("wifi")?;
+        let pc = net.create_node("pc", "computer")?;
+        net.connect(root, pc, Some(wifi))?;
+        net.remove_link(wifi)?;
+        assert!(net.link(wifi).is_none());
+        assert_eq!(net.node(pc).map(|n| n.subscriptions().len()), Some(0));
+        assert_eq!(net.node(root).map(|n| n.internal_links().len()), Some(0));
+        assert_eq!(net.node(pc).and_then(ControlNode::parent), Some(root));
         Ok(())
     }
 

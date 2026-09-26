@@ -41,18 +41,6 @@ pub(crate) const ALL: &[Scenario] = &[
     },
 ];
 
-/// Standard services every computer runs, matching the game's PC template.
-const COMPUTER_SERVICES: &[(&str, &str)] = &[
-    ("login-manager", "service"),
-    ("desktop", "service"),
-    ("registry", "service"),
-    ("file-system", "service"),
-    ("net-gateway", "gateway"),
-];
-
-/// Conventional name of a composite node's own internal bus.
-const IPC: &str = "ipc";
-
 // Built-in logic kinds (see `emergence_engine::LOGIC_KINDS`).
 const RESPONDER: &str = "responder";
 const GATEWAY: &str = "gateway";
@@ -125,30 +113,47 @@ impl<'w> Builder<'w> {
         Ok(node)
     }
 
-    /// A computer: the standard services plus `apps`, all on the computer's own `ipc` bus.
-    /// The computer is a gateway, everything inside answers pings, and an app called
-    /// `net-scan` scans the computer's networks. Returns the computer and its bus.
+    /// A computer from the templates library, nested in `parent` and attached to `links` (the
+    /// first also becomes one of `parent`'s internal links). `apps` are catalogue names.
     pub(crate) fn computer(
         &mut self,
         parent: NodeId,
         name: &str,
         links: &[LinkId],
         apps: &[&str],
-    ) -> Result<(NodeId, LinkId), NativeError> {
-        let pc = self.device(parent, name, "computer", links, GATEWAY)?;
-        let ipc = self.internal_link(pc, IPC)?;
-        for &(service, kind) in COMPUTER_SERVICES {
-            self.device(pc, service, kind, &[ipc], RESPONDER)?;
+    ) -> Result<NodeId, NativeError> {
+        let spec = serde_json::json!({ "apps": apps }).to_string();
+        let pc = self.world.build_template("computer", name, &spec)?;
+        self.world.connect(parent, pc, links.first().copied())?;
+        for &link in links.iter().skip(1) {
+            self.world.subscribe(pc, link)?;
         }
-        for &app in apps {
-            let logic = if app == "net-scan" {
-                SCANNER
-            } else {
-                RESPONDER
-            };
-            self.device(pc, app, "app", &[ipc], logic)?;
+        Ok(pc)
+    }
+
+    /// An NPC from the templates library, attached to `links`.
+    pub(crate) fn npc(
+        &mut self,
+        name: &str,
+        links: &[LinkId],
+        spec: &serde_json::Value,
+    ) -> Result<NodeId, NativeError> {
+        let npc = self.world.build_template("npc", name, &spec.to_string())?;
+        self.world.connect(self.root, npc, links.first().copied())?;
+        for &link in links.iter().skip(1) {
+            self.world.subscribe(npc, link)?;
         }
-        Ok((pc, ipc))
+        Ok(npc)
+    }
+
+    /// A computer's own bus. Scenarios normally treat a template's insides as private; this is
+    /// for the few that deliberately plug something extra in.
+    pub(crate) fn bus_of(&mut self, computer: NodeId) -> Result<LinkId, NativeError> {
+        self.world
+            .snapshot()?
+            .node(computer)
+            .and_then(|n| n.internal_links.first().copied())
+            .ok_or_else(|| NativeError::Sandbox("the computer has no bus".into()))
     }
 }
 
@@ -176,7 +181,7 @@ fn office(b: &mut Builder<'_>) -> BuildResult {
     // A rack groups servers behind its own backplane, one level deeper.
     let rack = b.device(root, "server-rack", "rack", &[lan], GATEWAY)?;
     let backplane = b.internal_link(rack, "backplane")?;
-    b.computer(rack, "srv-files", &[backplane], &["smb-share"])?;
+    b.computer(rack, "srv-files", &[backplane], &["file-share"])?;
     b.computer(rack, "srv-auth", &[backplane], &["directory"])?;
     b.computer(rack, "srv-backup", &[backplane], &["scheduler"])?;
 
@@ -191,23 +196,34 @@ fn office(b: &mut Builder<'_>) -> BuildResult {
     b.device(inventory, "rf-scanner", "device", &[pocket], SCANNER)?;
     b.device(player, "phone", "phone", &[pan, street], BEACON)?;
 
-    b.device(root, "npc-guard", "npc", &[npc_range], BEACON)?;
-    b.device(root, "npc-cleaner", "npc", &[npc_range], RESPONDER)?;
+    let guard = serde_json::json!({
+        "role": "guard",
+        "day_length": 96,
+        "schedule": [[0, "patrol"], [48, "check-doors"]],
+        "lines": ["Move along.", "Office is closed after six."],
+    });
+    b.npc("npc-guard", &[npc_range, street], &guard)?;
+    b.npc(
+        "npc-cleaner",
+        &[npc_range],
+        &serde_json::json!({ "role": "civilian" }),
+    )?;
     Ok(())
 }
 
 fn single_computer(b: &mut Builder<'_>) -> BuildResult {
     let wifi = b.world_link("wifi-1")?;
-    let (pc, ipc) = b.computer(
+    let pc = b.computer(
         b.root,
         "workstation",
         &[wifi],
         &["fileman", "terminal", "browser", "mail", "net-scan"],
     )?;
-    // An app that is itself a container: a VM host with a whole computer inside it.
+    // A VM host plugged into the computer's bus, with a whole computer inside it.
+    let ipc = b.bus_of(pc)?;
     let host = b.device(pc, "vm-host", "app", &[ipc], GATEWAY)?;
     let vm_net = b.internal_link(host, "vm-net")?;
-    b.computer(host, "vm-guest", &[vm_net], &["legacy-db", "net-scan"])?;
+    b.computer(host, "vm-guest", &[vm_net], &["database", "net-scan"])?;
     Ok(())
 }
 
