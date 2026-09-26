@@ -61,6 +61,17 @@ internal static class Program
             Expect(world.SnapshotJson().Contains("\"logic\":\"gateway\""), "snapshot shows logic");
             Expect(EmergenceLibrary.LogicKindsJson.Contains("responder"), "logic kinds listed");
 
+            // Structure queries.
+            Expect(world.Parent(app) == pc && world.Parent(root) == default, "parent");
+            Expect(world.Children(pc).Length == 1 && world.Children(pc)[0] == app, "children");
+            Expect(world.InternalLinks(pc).Length == 1 && world.InternalLinks(pc)[0] == ipc, "internal links");
+            Expect(world.Subscriptions(pc).Length == 1 && world.Subscriptions(pc)[0] == wifi, "subscriptions");
+            Expect(world.Subscribers(ipc).Length == 1 && world.Subscribers(ipc)[0] == app, "subscribers");
+            var many = world.CreateLink("many");
+            for (var i = 0; i < 40; i++) world.Subscribe(world.CreateNode($"n{i}", "device"), many);
+            Expect(world.Subscribers(many).Length == 40, "a list longer than the first buffer");
+            Expect(world.NodeName(app) == "fileman" && world.LinkName(wifi) == "wifi-1", "names");
+
             // Host nodes: the game runs the behaviour and Emergence carries the packets.
             var hostLink = world.CreateLink("host-bus");
             var hostA = world.CreateNode("host-a", "device");

@@ -320,8 +320,9 @@ impl World {
     /// Makes `node` a host node, or an ordinary one again.
     ///
     /// A host node's behaviour lives in the host (a game engine, say) instead of a
-    /// [`ControllerLogic`]: every packet on its links is handed over, whatever the accept rules
-    /// would say, and the host decides what it means. The host collects them after each tick with
+    /// [`ControllerLogic`]: every packet on the links it subscribes to is handed over, whatever the
+    /// accept rules would say, and the host decides what it means. Owning a link (as its parent)
+    /// does not make a host node hear it; only subscribing does. The host collects them after each tick with
     /// [`drain_host_deliveries`](Self::drain_host_deliveries) and answers with
     /// [`send_packet`](Self::send_packet). Making a node a host node removes its logic.
     ///
@@ -704,6 +705,16 @@ impl World {
         });
     }
 
+    /// Everyone who hears a packet `sender` puts on `via`. A host node hears exactly the links it
+    /// subscribes to: owning a link does not add it to the audience, as the host decides
+    /// everything about what the node takes in.
+    fn audience(&self, via: LinkId, sender: NodeId) -> Option<Vec<NodeId>> {
+        let link = self.network.link(via)?;
+        let mut out = listeners(&self.network, link, sender);
+        out.retain(|n| !self.hosts.contains_key(*n) || link.subscribers().contains(n));
+        Some(out)
+    }
+
     /// Puts one packet on its link and hands a copy to every listener that accepts it. Returns
     /// how many copies were delivered, or `None` if nothing was transmitted.
     fn transmit(&mut self, tick: u64, out: Outgoing) -> Option<u64> {
@@ -721,7 +732,7 @@ impl World {
             }
             return None;
         }
-        let audience = listeners(&self.network, self.network.link(out.via)?, out.sender);
+        let audience = self.audience(out.via, out.sender)?;
         let packet = Packet {
             id,
             from: out.from,
@@ -1384,6 +1395,42 @@ mod tests {
         world.send_packet(a, wifi, from, to, Event::new("ping"), 1)?;
         let _ = world.tick();
         assert!(world.drain_host_deliveries().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_host_node_hears_only_the_links_it_subscribes_to() -> TestResult {
+        let mut world = World::new();
+        let net = world.network_mut();
+        let bus = net.create_link("bus")?;
+        let (owner, a, b) = (
+            net.create_node("owner", "device")?,
+            net.create_node("a", "device")?,
+            net.create_node("b", "device")?,
+        );
+        net.connect(owner, a, Some(bus))?; // `owner` owns the bus but is not subscribed.
+        net.connect(owner, b, Some(bus))?;
+        for n in [owner, a, b] {
+            world.set_host(n, true)?;
+        }
+        let hop = |n: &str| PacketRoute::new(n, "bus");
+        world.send_packet(a, bus, hop("a"), hop("*"), Event::new("hello"), 8)?;
+        let _ = world.tick();
+        let heard: Vec<NodeId> = world
+            .drain_host_deliveries()
+            .iter()
+            .map(|d| d.receiver)
+            .collect();
+        assert_eq!(heard, [b]);
+
+        world.network_mut().subscribe(owner, bus)?;
+        world.send_packet(a, bus, hop("a"), hop("*"), Event::new("hello"), 8)?;
+        let _ = world.tick();
+        assert_eq!(
+            world.drain_host_deliveries().len(),
+            2,
+            "subscribed, the owner hears it"
+        );
         Ok(())
     }
 

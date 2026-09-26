@@ -1,0 +1,23 @@
+<!-- Runs the host layer (bindings/unity/Host) outside any engine, against the real native library.
+     Run with `cargo xtask test-csharp`, which passes EmergenceNativeLib. -->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <!-- Match Unity's C# version so code that compiles here also compiles in Unity. -->
+    <LangVersion>9.0</LangVersion>
+    <!-- The bindings are written without nullable annotations; the host layer turns them on itself. -->
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../unity/Runtime/**/*.cs" />
+    <Compile Include="../unity/Host/**/*.cs" />
+    <None Include="$(EmergenceNativeLib)" Condition="'$(EmergenceNativeLib)' != ''"
+          CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+
+</Project>

@@ -28,8 +28,8 @@ used from Unity (C#), Unreal (C++) or any other engine.
   packets move one hop per tick, the same inputs always give the same result, and a tick
   always finishes. `drain_trace()` reports what happened (sent, delivered, dropped, notes).
 - **Host nodes**: nodes whose behaviour lives in the host (a game's own C# logic, say) instead of a
-  `ControllerLogic`. `set_host(node, true)` hands every packet on the node's links to the host,
-  whatever the accept rules say; the host collects them after each tick with
+  `ControllerLogic`. `set_host(node, true)` hands every packet on the links the node subscribes
+  to (owning a link is not enough) to the host, whatever the accept rules say; the host collects them after each tick with
   `drain_host_deliveries()` and applies its own rules. It sends with `send_packet`, choosing the
   routes and event itself, so it can reply and forward. TTL is the library's loop protection: a
   host sends fresh packets without one (0 over the C ABI, `null` in C#) and passes a delivered
@@ -156,8 +156,9 @@ Deliberate differences from the SmitherNet design docs:
 | `crates/emergence-ffi` | C ABI over the engine. Builds `libemergence` (`.dylib`/`.dll`/`.so` and a static lib). |
 | `crates/emergence-sandbox` | Desktop test UI (egui). Loads the compiled `libemergence` at runtime, exactly like a game engine would. |
 | `bindings/c/emergence.h` | Generated C/C++ header (Unreal, custom engines). |
-| `bindings/unity/` | Unity package: generated P/Invoke bindings plus a safe C# wrapper. |
+| `bindings/unity/` | Unity package: `Runtime` (generated P/Invoke bindings plus a safe C# wrapper), `Host` (C# nodes on an Emergence world, engine-independent) and `Unity` (the driver that ticks it). |
 | `bindings/csharp-smoke/` | Compiles the Unity bindings with .NET and runs them against the real library. |
+| `bindings/csharp-host-smoke/` | Runs the host layer headless: C# nodes exchanging packets, leaving, and adopting a template-built computer. |
 | `xtask/` | Build tasks (`cargo xtask help`). |
 
 ## Common commands
@@ -170,7 +171,7 @@ cargo doc --open            # API docs
 
 cargo sandbox               # build the native library and run the test UI against it
 cargo xtask bindings        # regenerate the C header and C# bindings after changing the ABI
-cargo xtask test-csharp     # run the C# bindings against the native library (needs dotnet)
+cargo xtask test-csharp     # run the C# bindings and host layer against the native library (needs dotnet)
 cargo xtask dist            # package release builds for every platform into dist/ (--host: this one only)
 
 cargo fmt --all             # format
@@ -290,6 +291,38 @@ Environment variables for scripted runs:
    world.Tick();                                  // laptop gets the pong
    Debug.Log(world.DrainTraceJson());
    ```
+
+#### C# nodes: the host layer
+
+A game whose behaviour lives in C# doesn't need to drive `World` itself. The package's
+`Emergence.Host` assembly (no engine references) runs C# nodes on a world, and `Emergence.Unity`
+ticks it in Unity:
+
+- **`NodeModel`, `LinkModel`, `Packet`, `PacketRoute`**: C# nodes and links. Each node is an
+  Emergence host node: Emergence holds its place in the network and carries its packets, and the
+  node applies its own accept rules. Payloads stay C# objects.
+- **`LogicNode` + `NodeLogic`**: a node whose behaviour is a logic object with an outbox, drained
+  every tick, so sending is safe from any thread.
+- **`HostNetwork`**: every structure change (`Connect`, `Nest`, `MoveInto`, `Own`,
+  `SubscribeToLink`, `Disconnect`) goes through it, changing Emergence and the nodes' read-only
+  views (`InternalNodes`, `InternalLinks`, `Links`, `Parent`) together; `VerifyStructure` checks
+  they agree. `PushDirect` delivers at once, still through Emergence, counted by call site.
+  `BuildTemplateAt` + `Adopt` give a template-built node C# behaviour.
+- **`EmergenceDriver`** (Emergence.Unity): created automatically; calls `HostNetwork.Step()` every
+  50 ms on the main thread and sends `HostLog` to the Unity console. Point `HostLog`'s hooks at
+  your own logger to replace that.
+
+The packet streams are plain `System.IObservable<Packet>`, so UniRx or System.Reactive operators
+work on them; the package depends on neither.
+
+```csharp
+using Emergence.Host;
+
+var root = new NodeModel(Addresses.Root);
+var wifi = new LinkModel("wifi-1");
+HostNetwork.Connect(root, new MyPcNode("pc-1"), wifi);        // a LogicNode subclass
+HostNetwork.Connect(root, new MyPhoneNode("phone"), wifi);
+```
 
 `dist` builds the native library for every desktop platform, each in its own folder under
 `Runtime/Plugins/` with a `.meta` that makes it a native plugin for its own editor and player only:
