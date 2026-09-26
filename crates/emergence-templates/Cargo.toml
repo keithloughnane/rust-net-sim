@@ -1,0 +1,22 @@
+[package]
+name = "emergence-templates"
+description = "Pre-built composite nodes (computers, NPCs) for the Emergence Engine."
+readme = "../../README.md"
+keywords = ["simulation", "network", "gamedev"]
+categories = ["simulation", "game-development"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+# Deserialize template specs (used by the C ABI to take specs as JSON).
+serde = ["dep:serde"]
+
+[dependencies]
+emergence-engine.workspace = true
+serde = { version = "1", features = ["derive"], optional = true }
+
+[lints]
+workspace = true

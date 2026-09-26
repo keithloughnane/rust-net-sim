@@ -1,9 +1,19 @@
 [workspace]
 resolver = "3"
-members = ["crates/emergence-engine", "crates/emergence-ffi", "crates/emergence-sandbox", "xtask"]
+members = [
+    "crates/emergence-engine",
+    "crates/emergence-templates",
+    "crates/emergence-ffi",
+    "crates/emergence-sandbox",
+    "xtask",
+]
 # Plain `cargo build` / `cargo test` in the root only touch the library.
 # Use `cargo sandbox` (alias in .cargo/config.toml) to run the UI.
-default-members = ["crates/emergence-engine", "crates/emergence-ffi"]
+default-members = [
+    "crates/emergence-engine",
+    "crates/emergence-templates",
+    "crates/emergence-ffi",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +24,7 @@ repository = "https://github.com/keithloughnane/rust-net-sim"
 
 [workspace.dependencies]
 emergence-engine = { path = "crates/emergence-engine", version = "0.1.0" }
+emergence-templates = { path = "crates/emergence-templates", version = "0.1.0" }
 eframe = "0.32"
 
 [workspace.lints.rust]

@@ -51,8 +51,6 @@ enum Entry {
         text: String,
     },
     Alert(crate::health::AlertJson),
-    /// An event kind this ABI version cannot describe.
-    Other,
 }
 
 fn rule_name(rule: AcceptRule) -> &'static str {
@@ -62,7 +60,6 @@ fn rule_name(rule: AcceptRule) -> &'static str {
         AcceptRule::ChildToParent => "child_to_parent",
         AcceptRule::Gateway => "gateway",
         AcceptRule::Forced => "forced",
-        _ => "other",
     }
 }
 
@@ -71,7 +68,6 @@ fn reason_name(reason: DropReason) -> &'static str {
         DropReason::TtlExpired => "ttl_expired",
         DropReason::NoRecipient => "no_recipient",
         DropReason::SenderLeftLink => "sender_left_link",
-        _ => "other",
     }
 }
 
@@ -127,7 +123,6 @@ impl Trace {
                     node: node.to_raw(),
                     text,
                 },
-                _ => Entry::Other,
             })
             .collect();
         Self {

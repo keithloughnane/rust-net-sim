@@ -30,12 +30,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 
 use emergence_engine::{
-    Event, FAULTY_LOGIC_KINDS, LOGIC_KINDS, Limits, LinkId, LogicError, NetworkError, NodeId,
-    PacketRoute, SendError, TickOutcome, World,
+    ControlNode, Event, FAULTY_LOGIC_KINDS, LOGIC_KINDS, Limits, Link, LinkId, LogicError,
+    NetworkError, NodeId, PacketRoute, SendError, TickOutcome, World,
 };
 
 /// Version of the C ABI. Bump whenever an exported signature or type layout changes.
-pub const EMERGENCE_ABI_VERSION: u32 = 4;
+pub const EMERGENCE_ABI_VERSION: u32 = 5;
 
 static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 
@@ -59,7 +59,7 @@ pub enum EmergenceStatus {
     AlreadyHasParent = 6,
     /// The operation would nest a node inside itself.
     WouldCreateCycle = 7,
-    /// The root node cannot be given a parent.
+    /// The root node cannot be moved or removed.
     IsRoot = 8,
     /// The link is already internal to a different node.
     LinkOwnedElsewhere = 9,
@@ -83,12 +83,17 @@ pub enum EmergenceStatus {
     /// Not an error: the tick ran, but hit a hard limit and held packets back. The network is
     /// running away. Pause and read [`emergence_world_fuse_report_json`].
     FuseTripped = 18,
+    /// No template has that name.
+    UnknownTemplate = 19,
+    /// A template spec is not valid JSON or does not make sense for that template. See
+    /// [`emergence_world_last_error`] for why.
+    InvalidSpec = 20,
     /// The operation failed for a reason this ABI version does not have a code for.
     Failed = 255,
 }
 
 impl EmergenceStatus {
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 22] = [
         Self::Ok,
         Self::NullPointer,
         Self::Panic,
@@ -108,6 +113,8 @@ impl EmergenceStatus {
         Self::QueueFull,
         Self::PayloadTooLarge,
         Self::FuseTripped,
+        Self::UnknownTemplate,
+        Self::InvalidSpec,
         Self::Failed,
     ];
 
@@ -121,7 +128,7 @@ impl EmergenceStatus {
             Self::UnknownLink => c"unknown link",
             Self::AlreadyHasParent => c"the node already has a different parent",
             Self::WouldCreateCycle => c"a node cannot be nested inside itself",
-            Self::IsRoot => c"the root node cannot have a parent",
+            Self::IsRoot => c"the root node cannot be moved or removed",
             Self::LinkOwnedElsewhere => c"the link is already internal to another node",
             Self::NotAChild => c"the node is not a child of that parent",
             Self::UnknownLogic => c"no built-in logic has that name",
@@ -132,6 +139,8 @@ impl EmergenceStatus {
             Self::QueueFull => c"the send queue is full",
             Self::PayloadTooLarge => c"the event payload is too large",
             Self::FuseTripped => c"the fuse tripped: the network hit a hard limit",
+            Self::UnknownTemplate => c"no template has that name",
+            Self::InvalidSpec => c"invalid template spec",
             Self::Failed => c"the operation failed",
         }
     }
@@ -151,7 +160,6 @@ impl From<NetworkError> for EmergenceStatus {
             NetworkError::NameConflict { .. } | NetworkError::LinkNameConflict { .. } => {
                 Self::NameConflict
             }
-            _ => Self::Failed,
         }
     }
 }
@@ -161,7 +169,6 @@ impl From<LogicError> for EmergenceStatus {
         match error {
             LogicError::UnknownNode(_) => Self::UnknownNode,
             LogicError::UnknownKind(_) => Self::UnknownLogic,
-            _ => Self::Failed,
         }
     }
 }
@@ -175,7 +182,8 @@ impl From<SendError> for EmergenceStatus {
             SendError::Route(_) => Self::InvalidRoute,
             SendError::QueueFull => Self::QueueFull,
             SendError::PayloadTooLarge => Self::PayloadTooLarge,
-            _ => Self::Failed,
+            // Only logic can reply; nothing across this ABI can cause it.
+            SendError::NothingToReplyTo => Self::Failed,
         }
     }
 }
@@ -186,9 +194,10 @@ impl<E: Into<Self>> From<Result<(), E>> for EmergenceStatus {
     }
 }
 
-/// Opaque handle to a simulation world.
+/// Opaque handle to a simulation world, with the last detailed error message (see
+/// [`emergence_world_last_error`]).
 #[derive(Debug)]
-pub struct EmergenceWorld(World);
+pub struct EmergenceWorld(World, CString);
 
 /// Identifies a node within a world. `raw == 0` means "no node".
 #[repr(C)]
@@ -328,7 +337,7 @@ pub unsafe extern "C" fn emergence_world_create(
         return EmergenceStatus::NullPointer;
     }
     guard(|| {
-        let world = Box::into_raw(Box::new(EmergenceWorld(World::new())));
+        let world = Box::into_raw(Box::new(EmergenceWorld(World::new(), CString::default())));
         // SAFETY: checked non-null above; the caller guarantees it is writable.
         unsafe { out_world.write(world) };
         EmergenceStatus::Ok
@@ -611,6 +620,39 @@ pub unsafe extern "C" fn emergence_network_disconnect(
     }
 }
 
+/// Deletes `node`, everything nested inside it, and the links they own. Other nodes lose their
+/// subscriptions to those links. IDs of removed nodes and links never resolve again.
+///
+/// # Safety
+///
+/// `world` must be null or a live handle, not in use on another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emergence_network_remove_node(
+    world: *mut EmergenceWorld,
+    node: EmergenceNodeId,
+) -> EmergenceStatus {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { with_world(world, |world| world.remove_node(node.into()).into()) }
+}
+
+/// Deletes `link`. Its subscribers and owner stay; they just lose the link.
+///
+/// # Safety
+///
+/// `world` must be null or a live handle, not in use on another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emergence_network_remove_link(
+    world: *mut EmergenceWorld,
+    link: EmergenceLinkId,
+) -> EmergenceStatus {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        with_world(world, |world| {
+            world.network_mut().remove_link(link.into()).into()
+        })
+    }
+}
+
 /// Writes a JSON description of the whole network to `out_json`. Free it with
 /// [`emergence_string_free`].
 ///
@@ -656,6 +698,7 @@ pub extern "C" fn emergence_logic_kinds_json() -> *const c_char {
         .get_or_init(|| {
             let kinds: Vec<Kind> = LOGIC_KINDS
                 .iter()
+                .chain(emergence_templates::LOGIC_KINDS)
                 .map(|&name| Kind {
                     name,
                     faulty: false,
@@ -670,6 +713,250 @@ pub extern "C" fn emergence_logic_kinds_json() -> *const c_char {
             CString::new(json).unwrap_or_default()
         })
         .as_ptr()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Templates
+// ---------------------------------------------------------------------------------------------
+
+/// Returns the template catalogue as a static JSON string. Do not free it. Shape:
+///
+/// ```json
+/// { "templates": [{"name": "computer", "description": "..."}, ...],
+///   "apps": [{"name": "fileman", "title": "File manager"}, ...],
+///   "hardware": ["wifi", "modem", "promiscuous-nic"],
+///   "npc_roles": ["guard", "civilian"],
+///   "base_services": ["login-manager", ...],
+///   "defaults": {"computer": {...spec...}, "npc": {...spec...}} }
+/// ```
+#[unsafe(no_mangle)]
+pub extern "C" fn emergence_templates_catalog_json() -> *const c_char {
+    use emergence_templates::{
+        AppKind, BASE_SERVICES, ComputerSpec, HardwareTag, NpcRole, NpcSpec, TEMPLATES,
+    };
+    use serde_json::json;
+    static CATALOG: OnceLock<CString> = OnceLock::new();
+    CATALOG
+        .get_or_init(|| {
+            let catalog = json!({
+                "templates": TEMPLATES
+                    .iter()
+                    .map(|(name, description)| json!({ "name": name, "description": description }))
+                    .collect::<Vec<_>>(),
+                "apps": AppKind::ALL
+                    .iter()
+                    .map(|a| json!({ "name": a.name(), "title": a.title() }))
+                    .collect::<Vec<_>>(),
+                "hardware": HardwareTag::ALL.iter().map(|h| h.name()).collect::<Vec<_>>(),
+                "npc_roles": NpcRole::ALL.iter().map(|r| r.name()).collect::<Vec<_>>(),
+                "base_services": BASE_SERVICES.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+                "defaults": { "computer": ComputerSpec::default(), "npc": NpcSpec::default() },
+            });
+            CString::new(catalog.to_string()).unwrap_or_default()
+        })
+        .as_ptr()
+}
+
+/// Builds a node from a template and writes its root to `out_root`. The node is detached:
+/// attach it with [`emergence_network_connect`].
+///
+/// `template` is a name from [`emergence_templates_catalog_json`]. `spec_json` holds that
+/// template's parameters; missing fields take their defaults, and null or `""` means all
+/// defaults. For example, for `"computer"`:
+/// `{"apps": ["fileman", "net-scan"], "hardware": ["wifi"]}`.
+///
+/// On failure, [`emergence_world_last_error`] says why.
+///
+/// # Safety
+///
+/// `world` must be null or a live handle, not in use on another thread. `template` and `name`
+/// must be null or NUL-terminated strings; `spec_json` may be null. `out_root` must be null or
+/// valid for a write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emergence_template_build(
+    world: *mut EmergenceWorld,
+    template: *const c_char,
+    name: *const c_char,
+    spec_json: *const c_char,
+    out_root: *mut EmergenceNodeId,
+) -> EmergenceStatus {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { template_build_inner(world, template, name, spec_json, None, out_root) }
+}
+
+/// Builds a node from a template and connects it in one step: nested in `parent`, on `link`
+/// (`raw == 0` for no link). If building or connecting fails, nothing is left in the world:
+/// compare [`emergence_template_build`] followed by [`emergence_network_connect`], where a failed
+/// connect leaves the node built but detached.
+///
+/// # Safety
+///
+/// As for [`emergence_template_build`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emergence_template_build_at(
+    world: *mut EmergenceWorld,
+    template: *const c_char,
+    name: *const c_char,
+    spec_json: *const c_char,
+    parent: EmergenceNodeId,
+    link: EmergenceLinkId,
+    out_root: *mut EmergenceNodeId,
+) -> EmergenceStatus {
+    let at = emergence_templates::Placement {
+        parent: parent.into(),
+        link: (link.raw != 0).then(|| link.into()),
+    };
+    // SAFETY: forwarded from this function's contract.
+    unsafe { template_build_inner(world, template, name, spec_json, Some(at), out_root) }
+}
+
+/// Shared body of the two template-build functions.
+///
+/// # Safety
+///
+/// As for [`emergence_template_build`].
+unsafe fn template_build_inner(
+    world: *mut EmergenceWorld,
+    template: *const c_char,
+    name: *const c_char,
+    spec_json: *const c_char,
+    at: Option<emergence_templates::Placement>,
+    out_root: *mut EmergenceNodeId,
+) -> EmergenceStatus {
+    if out_root.is_null() {
+        return EmergenceStatus::NullPointer;
+    }
+    // SAFETY: the caller guarantees the handle is null or live and not aliased.
+    let Some(EmergenceWorld(world, last_error)) = (unsafe { world.as_mut() }) else {
+        return EmergenceStatus::NullPointer;
+    };
+    // SAFETY: forwarded from this function's contract.
+    let strings = unsafe {
+        let spec = if spec_json.is_null() {
+            Ok("")
+        } else {
+            borrow_str(spec_json)
+        };
+        (borrow_str(template), borrow_str(name), spec)
+    };
+    let (template, name, spec) = match strings {
+        (Ok(t), Ok(n), Ok(s)) => (t, n, s),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return e,
+    };
+    guard(|| match build_template(world, template, name, spec, at) {
+        Ok(root) => {
+            // SAFETY: checked non-null above; the caller guarantees it is writable.
+            unsafe { out_root.write(root.into()) };
+            EmergenceStatus::Ok
+        }
+        Err((status, why)) => {
+            *last_error = CString::new(why).unwrap_or_default();
+            status
+        }
+    })
+}
+
+/// The safe half of [`emergence_template_build`] and [`emergence_template_build_at`].
+fn build_template(
+    world: &mut World,
+    template: &str,
+    name: &str,
+    spec: &str,
+    at: Option<emergence_templates::Placement>,
+) -> Result<NodeId, (EmergenceStatus, String)> {
+    use emergence_templates::{
+        ComputerSpec, NpcSpec, TemplateError, build_computer, build_computer_at, build_npc,
+        build_npc_at,
+    };
+    fn parse<T: serde::de::DeserializeOwned + Default>(
+        json: &str,
+    ) -> Result<T, (EmergenceStatus, String)> {
+        match json.trim() {
+            "" | "null" => Ok(T::default()),
+            json => serde_json::from_str(json)
+                .map_err(|e| (EmergenceStatus::InvalidSpec, format!("invalid spec: {e}"))),
+        }
+    }
+    let describe = |world: &World, e: &TemplateError| -> String {
+        let node_name = |id| {
+            world
+                .network()
+                .node(id)
+                .map_or("?", ControlNode::name)
+                .to_owned()
+        };
+        let link_name = |id| world.network().link(id).map_or("?", Link::name).to_owned();
+        match e {
+            TemplateError::Network(NetworkError::NameConflict { with, .. }) => format!(
+                "`{name}` is already the name of {} on that link",
+                node_name(*with)
+            ),
+            TemplateError::Network(NetworkError::LinkOwnedElsewhere(link)) => format!(
+                "link `{}` already belongs to another node",
+                link_name(*link)
+            ),
+            TemplateError::Network(NetworkError::LinkNameConflict { with, .. }) => format!(
+                "there is already a link called `{}` there",
+                link_name(*with)
+            ),
+            TemplateError::Network(NetworkError::UnknownNode(_)) => {
+                "the parent node does not exist".into()
+            }
+            TemplateError::Network(NetworkError::UnknownLink(_)) => {
+                "the link does not exist".into()
+            }
+            other => other.to_string(),
+        }
+    };
+    let status = |world: &World, e: TemplateError| -> (EmergenceStatus, String) {
+        let why = describe(world, &e);
+        let status = match e {
+            TemplateError::AppInstalledTwice(_)
+            | TemplateError::NameUsedInside(_)
+            | TemplateError::Npc(_) => EmergenceStatus::InvalidSpec,
+            TemplateError::Network(n) => n.into(),
+            TemplateError::Logic(l) => l.into(),
+        };
+        (status, why)
+    };
+    match template {
+        "computer" => {
+            let spec = parse::<ComputerSpec>(spec)?;
+            match at {
+                Some(at) => build_computer_at(world, name, &spec, at),
+                None => build_computer(world, name, &spec),
+            }
+            .map_err(|e| status(world, e))
+        }
+        "npc" => {
+            let spec = parse::<NpcSpec>(spec)?;
+            match at {
+                Some(at) => build_npc_at(world, name, &spec, at),
+                None => build_npc(world, name, &spec),
+            }
+            .map_err(|e| status(world, e))
+        }
+        _ => Err((
+            EmergenceStatus::UnknownTemplate,
+            format!("no template named `{template}`"),
+        )),
+    }
+}
+
+/// Returns a description of the last error on this world that had more to say than its status
+/// code (today: template builds), or `""`. The string belongs to the world and stays valid until
+/// the next such error or until the world is destroyed. Do not free it.
+///
+/// # Safety
+///
+/// `world` must be null or a live handle, not in use on another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emergence_world_last_error(world: *const EmergenceWorld) -> *const c_char {
+    // SAFETY: the caller guarantees the handle is null or live.
+    match unsafe { world.as_ref() } {
+        Some(world) => world.1.as_ptr(),
+        None => c"".as_ptr(),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -787,7 +1074,10 @@ pub unsafe extern "C" fn emergence_world_set_logic(
     // SAFETY: forwarded from this function's contract.
     unsafe {
         with_world(world, |world| match borrow_str(kind) {
-            Ok(kind) => world.set_logic_kind(node.into(), kind).into(),
+            Ok(kind) => match emergence_templates::create_logic(kind) {
+                Some(logic) => world.set_logic(node.into(), logic).into(),
+                None => world.set_logic_kind(node.into(), kind).into(),
+            },
             Err(status) => status,
         })
     }
@@ -1336,5 +1626,123 @@ mod tests {
             only_alerts,
             "packet tracing was off, so only alerts are recorded"
         );
+    }
+
+    #[test]
+    fn templates_build_through_the_abi() {
+        let world = TestWorld::new();
+        let (root, wifi) = (world.root(), world.link(c"wifi"));
+        let mut pc = EmergenceNodeId { raw: 0 };
+        let spec = c"{\"apps\":[\"fileman\",\"net-scan\"],\"hardware\":[\"wifi\"]}";
+        // SAFETY: live world, valid strings and out-pointer.
+        unsafe {
+            let status = emergence_template_build(
+                world.0,
+                c"computer".as_ptr(),
+                c"pc-1".as_ptr(),
+                spec.as_ptr(),
+                &raw mut pc,
+            );
+            assert_eq!(status, EmergenceStatus::Ok);
+            assert_eq!(
+                emergence_network_connect(world.0, root, pc, wifi),
+                EmergenceStatus::Ok
+            );
+        }
+        let snap = world.snapshot();
+        let names: Vec<&str> = snap["nodes"]
+            .as_array()
+            .map(|n| n.iter().filter_map(|n| n["name"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(names.contains(&"net-scan") && names.contains(&"drive-bay"));
+
+        let mut bad = EmergenceNodeId { raw: 0 };
+        // SAFETY: as above.
+        unsafe {
+            let status = emergence_template_build(
+                world.0,
+                c"computer".as_ptr(),
+                c"pc-2".as_ptr(),
+                c"{\"apps\":[\"doom\"]}".as_ptr(),
+                &raw mut bad,
+            );
+            assert_eq!(status, EmergenceStatus::InvalidSpec);
+            let why = CStr::from_ptr(emergence_world_last_error(world.0));
+            assert!(why.to_string_lossy().contains("doom"), "{why:?}");
+            let status = emergence_template_build(
+                world.0,
+                c"toaster".as_ptr(),
+                c"t".as_ptr(),
+                ptr::null(),
+                &raw mut bad,
+            );
+            assert_eq!(status, EmergenceStatus::UnknownTemplate);
+        }
+        // SAFETY: returns a static string.
+        let catalog = unsafe { CStr::from_ptr(emergence_templates_catalog_json()) };
+        let catalog: serde_json::Value =
+            serde_json::from_slice(catalog.to_bytes()).unwrap_or_default();
+        assert_eq!(catalog["templates"][0]["name"], "computer");
+        assert!(catalog["defaults"]["npc"]["lines"].is_array());
+    }
+
+    #[test]
+    fn one_step_build_rolls_back_but_two_steps_keep_the_node() {
+        let world = TestWorld::new();
+        let (root, wifi) = (world.root(), world.link(c"wifi"));
+        let first = world.node(c"pc");
+        let count = || world.snapshot()["nodes"].as_array().map_or(0, Vec::len);
+        let mut id = EmergenceNodeId { raw: 0 };
+        // SAFETY: live world, valid strings and out-pointer.
+        unsafe {
+            assert_eq!(
+                emergence_network_connect(world.0, root, first, wifi),
+                EmergenceStatus::Ok
+            );
+            let before = count();
+            let status = emergence_template_build_at(
+                world.0,
+                c"computer".as_ptr(),
+                c"pc".as_ptr(),
+                ptr::null(),
+                root,
+                wifi,
+                &raw mut id,
+            );
+            assert_eq!(status, EmergenceStatus::NameConflict);
+            assert_eq!(count(), before, "one step: nothing left behind");
+
+            let status = emergence_template_build(
+                world.0,
+                c"computer".as_ptr(),
+                c"pc".as_ptr(),
+                ptr::null(),
+                &raw mut id,
+            );
+            assert_eq!(status, EmergenceStatus::Ok);
+            assert_eq!(
+                emergence_network_connect(world.0, root, id, wifi),
+                EmergenceStatus::NameConflict
+            );
+            assert!(count() > before, "two steps: the built node stays");
+
+            assert_eq!(
+                emergence_network_remove_node(world.0, id),
+                EmergenceStatus::Ok
+            );
+            assert_eq!(count(), before, "and can be removed");
+            assert_eq!(
+                emergence_network_remove_node(world.0, id),
+                EmergenceStatus::UnknownNode
+            );
+            assert_eq!(
+                emergence_network_remove_node(world.0, root),
+                EmergenceStatus::IsRoot
+            );
+            assert_eq!(
+                emergence_network_remove_link(world.0, wifi),
+                EmergenceStatus::Ok
+            );
+        }
     }
 }

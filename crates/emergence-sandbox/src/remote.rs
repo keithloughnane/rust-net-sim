@@ -285,6 +285,29 @@ impl SandboxApp {
                 }
                 None => Response::ok("the fuse has not tripped", json!({ "tripped": false })),
             },
+            Request::Templates => self.templates_info(),
+            Request::Add {
+                template,
+                name,
+                parent,
+                link,
+                new_link,
+                spec,
+            } => self.remote_add(
+                template,
+                name,
+                parent.as_deref(),
+                link.as_deref(),
+                new_link,
+                spec,
+            ),
+            Request::Remove { node } => match self.find(&node) {
+                Ok(id) => match self.remove_node(id) {
+                    Ok(text) => Response::text(text),
+                    Err(e) => Response::error(e),
+                },
+                Err(e) => e,
+            },
             Request::Screenshot { path } => {
                 if self.deferred.screenshot.is_some() {
                     Response::error("a screenshot is already being taken")
@@ -304,6 +327,85 @@ impl SandboxApp {
         };
         ctx.request_repaint();
         Some(response)
+    }
+
+    fn templates_info(&self) -> Response {
+        let Ok(library) = &self.library else {
+            return Response::error("the library is not loaded");
+        };
+        let c = library.templates();
+        let mut text = String::new();
+        for t in &c.templates {
+            let _ = writeln!(text, "{:<10} {}", t.name, t.description);
+        }
+        let apps: Vec<&str> = c.apps.iter().map(|a| a.name.as_str()).collect();
+        let _ = writeln!(text, "\napps: {}", apps.join(", "));
+        let _ = writeln!(text, "hardware: {}", c.hardware.join(", "));
+        let _ = write!(text, "npc roles: {}", c.npc_roles.join(", "));
+        Response::ok(text, c.defaults.clone())
+    }
+
+    fn remote_add(
+        &mut self,
+        template: String,
+        name: String,
+        parent: Option<&str>,
+        link: Option<&str>,
+        new_link: Option<String>,
+        spec: Option<Value>,
+    ) -> Response {
+        use crate::add_node::{AddRequest, LinkTarget};
+        let parent = match parent {
+            Some(p) => match self.find(p) {
+                Ok(id) => id,
+                Err(e) => return e,
+            },
+            None => match (self.scope, &self.loaded) {
+                (Some(s), _) => s,
+                (None, Ok(l)) => l.snapshot.root(),
+                (None, Err(e)) => return Response::error(e.clone()),
+            },
+        };
+        let target = match (link, new_link) {
+            (Some(_), Some(_)) => return Response::error("give --link or --new-link, not both"),
+            (None, Some(n)) => LinkTarget::New(n),
+            (None, None) => LinkTarget::None,
+            (Some(l), None) => {
+                let Ok(loaded) = &self.loaded else {
+                    return Response::error("nothing is loaded");
+                };
+                let snap = &loaded.snapshot;
+                let found = snap.node(parent).and_then(|p| {
+                    p.internal_links
+                        .iter()
+                        .copied()
+                        .find(|&id| snap.link_name(id) == l)
+                });
+                match found {
+                    Some(id) => LinkTarget::Existing(id),
+                    None => {
+                        return Response::error(format!(
+                            "{} has no link called `{l}` (use --new-link to make one)",
+                            name_of(snap, parent)
+                        ));
+                    }
+                }
+            }
+        };
+        let request = AddRequest {
+            template,
+            name,
+            spec_json: spec.map_or_else(String::new, |s| s.to_string()),
+            parent,
+            link: target,
+        };
+        match self.add_node(&request) {
+            Ok(text) => {
+                self.scope = Some(parent);
+                Response::ok(text, json!({ "name": request.name }))
+            }
+            Err(e) => Response::error(e),
+        }
     }
 
     fn step(&mut self, ctx: &egui::Context, ticks: u32) -> Response {

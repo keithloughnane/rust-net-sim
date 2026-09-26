@@ -22,7 +22,7 @@ namespace Emergence.Native
         /// <summary>
         ///  Version of the C ABI. Bump whenever an exported signature or type layout changes.
         /// </summary>
-        internal const uint EMERGENCE_ABI_VERSION = 4;
+        internal const uint EMERGENCE_ABI_VERSION = 5;
 
 
 
@@ -202,6 +202,27 @@ namespace Emergence.Native
         internal static extern EmergenceStatus emergence_network_disconnect(EmergenceWorld* world, EmergenceNodeId parent, EmergenceNodeId node);
 
         /// <summary>
+        ///  Deletes `node`, everything nested inside it, and the links they own. Other nodes lose their
+        ///  subscriptions to those links. IDs of removed nodes and links never resolve again.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_remove_node", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_remove_node(EmergenceWorld* world, EmergenceNodeId node);
+
+        /// <summary>
+        ///  Deletes `link`. Its subscribers and owner stay; they just lose the link.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_network_remove_link", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_network_remove_link(EmergenceWorld* world, EmergenceLinkId link);
+
+        /// <summary>
         ///  Writes a JSON description of the whole network to `out_json`. Free it with
         ///  [`emergence_string_free`].
         ///
@@ -223,6 +244,66 @@ namespace Emergence.Native
         /// </summary>
         [DllImport(__DllName, EntryPoint = "emergence_logic_kinds_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern byte* emergence_logic_kinds_json();
+
+        /// <summary>
+        ///  Returns the template catalogue as a static JSON string. Do not free it. Shape:
+        ///
+        ///  ```json
+        ///  { "templates": [{"name": "computer", "description": "..."}, ...],
+        ///    "apps": [{"name": "fileman", "title": "File manager"}, ...],
+        ///    "hardware": ["wifi", "modem", "promiscuous-nic"],
+        ///    "npc_roles": ["guard", "civilian"],
+        ///    "base_services": ["login-manager", ...],
+        ///    "defaults": {"computer": {...spec...}, "npc": {...spec...}} }
+        ///  ```
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_templates_catalog_json", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern byte* emergence_templates_catalog_json();
+
+        /// <summary>
+        ///  Builds a node from a template and writes its root to `out_root`. The node is detached:
+        ///  attach it with [`emergence_network_connect`].
+        ///
+        ///  `template` is a name from [`emergence_templates_catalog_json`]. `spec_json` holds that
+        ///  template's parameters; missing fields take their defaults, and null or `""` means all
+        ///  defaults. For example, for `"computer"`:
+        ///  `{"apps": ["fileman", "net-scan"], "hardware": ["wifi"]}`.
+        ///
+        ///  On failure, [`emergence_world_last_error`] says why.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread. `template` and `name`
+        ///  must be null or NUL-terminated strings; `spec_json` may be null. `out_root` must be null or
+        ///  valid for a write.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_template_build", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_template_build(EmergenceWorld* world, byte* template, byte* name, byte* spec_json, EmergenceNodeId* out_root);
+
+        /// <summary>
+        ///  Builds a node from a template and connects it in one step: nested in `parent`, on `link`
+        ///  (`raw == 0` for no link). If building or connecting fails, nothing is left in the world:
+        ///  compare [`emergence_template_build`] followed by [`emergence_network_connect`], where a failed
+        ///  connect leaves the node built but detached.
+        ///
+        ///  # Safety
+        ///
+        ///  As for [`emergence_template_build`].
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_template_build_at", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern EmergenceStatus emergence_template_build_at(EmergenceWorld* world, byte* template, byte* name, byte* spec_json, EmergenceNodeId parent, EmergenceLinkId link, EmergenceNodeId* out_root);
+
+        /// <summary>
+        ///  Returns a description of the last error on this world that had more to say than its status
+        ///  code (today: template builds), or `""`. The string belongs to the world and stays valid until
+        ///  the next such error or until the world is destroyed. Do not free it.
+        ///
+        ///  # Safety
+        ///
+        ///  `world` must be null or a live handle, not in use on another thread.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "emergence_world_last_error", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern byte* emergence_world_last_error(EmergenceWorld* world);
 
         /// <summary>
         ///  Sets the fuse's hard limits. 0 keeps a limit's current value.
@@ -318,7 +399,8 @@ namespace Emergence.Native
     }
 
     /// <summary>
-    ///  Opaque handle to a simulation world.
+    ///  Opaque handle to a simulation world, with the last detailed error message (see
+    ///  [`emergence_world_last_error`]).
     /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     internal unsafe partial struct EmergenceWorld
@@ -388,7 +470,7 @@ namespace Emergence.Native
         /// </summary>
         WouldCreateCycle = 7,
         /// <summary>
-        ///  The root node cannot be given a parent.
+        ///  The root node cannot be moved or removed.
         /// </summary>
         IsRoot = 8,
         /// <summary>
@@ -433,6 +515,15 @@ namespace Emergence.Native
         ///  running away. Pause and read [`emergence_world_fuse_report_json`].
         /// </summary>
         FuseTripped = 18,
+        /// <summary>
+        ///  No template has that name.
+        /// </summary>
+        UnknownTemplate = 19,
+        /// <summary>
+        ///  A template spec is not valid JSON or does not make sense for that template. See
+        ///  [`emergence_world_last_error`] for why.
+        /// </summary>
+        InvalidSpec = 20,
         /// <summary>
         ///  The operation failed for a reason this ABI version does not have a code for.
         /// </summary>

@@ -4,7 +4,6 @@ use crate::{AcceptRule, Alert, LinkId, NodeId, Packet, PacketId};
 
 /// Why a packet copy went nowhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum DropReason {
     /// Its hop budget ran out: usually a routing loop.
     TtlExpired,
@@ -16,7 +15,6 @@ pub enum DropReason {
 
 /// Something that happened during a tick, for debugging tools and visualisers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum TraceEvent {
     /// `sender` put `packet` on `link`.
     Sent {

@@ -85,6 +85,18 @@ pub(crate) enum Request {
         last: usize,
     },
     Fuse,
+    Templates,
+    Add {
+        template: String,
+        name: String,
+        parent: Option<String>,
+        link: Option<String>,
+        new_link: Option<String>,
+        spec: Option<serde_json::Value>,
+    },
+    Remove {
+        node: String,
+    },
     Screenshot {
         path: String,
     },

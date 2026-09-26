@@ -68,6 +68,85 @@ namespace Emergence
         public void SetTracePackets(bool enabled) =>
             EmergenceLibrary.Check(NativeMethods.emergence_world_set_trace_packets(Handle, enabled ? 1u : 0u));
 
+        /// <summary>
+        /// Builds a node from a template (see <see cref="EmergenceLibrary.TemplatesCatalogJson"/>),
+        /// detached: attach it with <see cref="Connect"/>. If that connect then fails, the node
+        /// stays built but unattached. On failure here, nothing was built.
+        /// </summary>
+        /// <param name="template">"computer" or "npc".</param>
+        /// <param name="name">The new node's name.</param>
+        /// <param name="specJson">The template's parameters as JSON, or null for defaults.</param>
+        public BuildResult BuildTemplate(string template, string name, string specJson = null)
+        {
+            var (status, root, why) = CallBuild(template, name, specJson, null);
+            return BuildResult.From(status, root, why);
+        }
+
+        /// <summary>
+        /// Builds a node from a template and connects it in one step: inside
+        /// <paramref name="parent"/>, on <paramref name="link"/> (default: no link). On any failure,
+        /// nothing was added to the world.
+        /// </summary>
+        public BuildAtResult BuildTemplateAt(string template, string name, NodeId parent,
+            LinkId link = default, string specJson = null)
+        {
+            var (status, root, why) = CallBuild(template, name, specJson, (parent, link));
+            return BuildAtResult.From(status, root, why);
+        }
+
+        /// <summary>Builds a computer with the given apps and hardware tags (catalogue names).</summary>
+        public BuildResult BuildComputer(string name, string[] apps = null, string[] hardware = null) =>
+            BuildTemplate("computer", name, ComputerSpec(apps, hardware));
+
+        /// <summary>Builds a computer and connects it in one step.</summary>
+        public BuildAtResult BuildComputerAt(string name, NodeId parent, LinkId link = default,
+            string[] apps = null, string[] hardware = null) =>
+            BuildTemplateAt("computer", name, parent, link, ComputerSpec(apps, hardware));
+
+        private static string ComputerSpec(string[] apps, string[] hardware) =>
+            "{\"apps\":" + JsonArray(apps) + ",\"hardware\":" + JsonArray(hardware) + "}";
+
+        private (EmergenceStatus, NodeId, string) CallBuild(string template, string name, string specJson,
+            (NodeId parent, LinkId link)? at)
+        {
+            var t = ToUtf8(template, nameof(template));
+            var n = ToUtf8(name, nameof(name));
+            var spec = specJson == null ? null : ToUtf8(specJson, nameof(specJson));
+            EmergenceNodeId id;
+            EmergenceStatus status;
+            fixed (byte* tPtr = t)
+            fixed (byte* nPtr = n)
+            fixed (byte* sPtr = spec)
+            {
+                status = at is var (parent, link)
+                    ? NativeMethods.emergence_template_build_at(
+                        Handle, tPtr, nPtr, sPtr, parent.ToNative(), link.ToNative(), &id)
+                    : NativeMethods.emergence_template_build(Handle, tPtr, nPtr, sPtr, &id);
+            }
+            var why = status == EmergenceStatus.Ok
+                ? ""
+                : EmergenceLibrary.FromUtf8(NativeMethods.emergence_world_last_error(Handle));
+            return (status, new NodeId(id), why);
+        }
+
+        private static string JsonArray(string[] items)
+        {
+            if (items == null || items.Length == 0) return "[]";
+            var sb = new StringBuilder("[");
+            for (var i = 0; i < items.Length; i++)
+            {
+                if (i > 0) sb.Append(',');
+                sb.Append('"');
+                foreach (var c in items[i])
+                {
+                    if (c == '"' || c == '\\') sb.Append('\\');
+                    sb.Append(c);
+                }
+                sb.Append('"');
+            }
+            return sb.Append(']').ToString();
+        }
+
         /// <summary>The world's load and safety counters, as JSON.</summary>
         public string HealthJson() => TakeString(NativeMethods.emergence_world_health_json);
 
@@ -137,11 +216,23 @@ namespace Emergence
 
         /// <summary>
         /// Nests <paramref name="node"/> inside <paramref name="parent"/>. If a link is given, also
-        /// makes it internal to the parent and subscribes the node to it.
+        /// makes it internal to the parent and subscribes the node to it. On failure, nothing
+        /// changed.
         /// </summary>
-        public void Connect(NodeId parent, NodeId node, LinkId link = default) =>
-            EmergenceLibrary.Check(NativeMethods.emergence_network_connect(
+        public ConnectResult Connect(NodeId parent, NodeId node, LinkId link = default) =>
+            ConnectResult.From(NativeMethods.emergence_network_connect(
                 Handle, parent.ToNative(), node.ToNative(), link.ToNative()));
+
+        /// <summary>
+        /// Deletes <paramref name="node"/>, everything inside it, and the links they own. Other
+        /// nodes lose their subscriptions to those links.
+        /// </summary>
+        public RemoveResult RemoveNode(NodeId node) =>
+            RemoveResult.From(NativeMethods.emergence_network_remove_node(Handle, node.ToNative()));
+
+        /// <summary>Deletes <paramref name="link"/>; its subscribers and owner stay.</summary>
+        public RemoveResult RemoveLink(LinkId link) =>
+            RemoveResult.From(NativeMethods.emergence_network_remove_link(Handle, link.ToNative()));
 
         /// <summary>Attaches <paramref name="node"/> to <paramref name="link"/> without changing the hierarchy.</summary>
         public void Subscribe(NodeId node, LinkId link) =>

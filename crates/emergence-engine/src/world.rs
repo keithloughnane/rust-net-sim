@@ -24,7 +24,6 @@ pub struct NodeStats {
 
 /// Why logic could not be attached.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum LogicError {
     /// The node does not exist.
     UnknownNode(NodeId),
@@ -73,7 +72,6 @@ impl Default for Limits {
 
 /// Which limit a tick hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum FuseLimit {
     /// [`Limits::max_transmissions_per_tick`].
     Transmissions,
@@ -274,6 +272,22 @@ impl World {
     #[must_use]
     pub fn fuse_report(&self) -> Option<&FuseReport> {
         self.fuse.as_ref()
+    }
+
+    /// Deletes `node`, everything nested inside it, and the links they own, along with their
+    /// logic and counters. Packets they had queued are dropped when their turn comes. See
+    /// [`Network::remove_node`].
+    ///
+    /// # Errors
+    ///
+    /// Fails without changing anything if the node is unknown or is the root.
+    pub fn remove_node(&mut self, node: NodeId) -> Result<(), crate::NetworkError> {
+        let removed = self.network_mut().remove_node(node)?;
+        for n in removed {
+            self.logics.remove(n);
+            self.stats.remove(n);
+        }
+        Ok(())
     }
 
     /// Attaches `logic` to `node`, replacing any it had, and runs its `on_start`.

@@ -15,7 +15,6 @@ use crate::{ControllerLogic, LinkId, Network, NodeId, Packet, Relaying};
 
 /// Which check raised an alert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[non_exhaustive]
 pub enum Check {
     /// Too many packets per tick across the whole network.
     NetworkRate,

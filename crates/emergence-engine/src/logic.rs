@@ -52,7 +52,6 @@ pub enum Relaying {
 
 /// Why a node accepted a packet (see the routing rules in the design docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum AcceptRule {
     /// Addressed to this node by name.
     Addressed,
@@ -68,7 +67,6 @@ pub enum AcceptRule {
 
 /// Why a send was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum SendError {
     /// The sending node does not exist.
     UnknownNode(NodeId),

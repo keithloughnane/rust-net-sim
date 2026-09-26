@@ -12,6 +12,18 @@ internal static class Program
         _failures++;
     }
 
+    private static int CountNodes(World world)
+    {
+        var json = world.SnapshotJson();
+        var count = 0;
+        for (var i = json.IndexOf("\"kind\":", StringComparison.Ordinal); i >= 0;
+             i = json.IndexOf("\"kind\":", i + 1, StringComparison.Ordinal))
+        {
+            count++;
+        }
+        return count;
+    }
+
     private static int Main()
     {
         Console.WriteLine($"Emergence {EmergenceLibrary.Version} (ABI {EmergenceLibrary.AbiVersion})");
@@ -70,6 +82,42 @@ internal static class Program
             Expect(world.FuseReportJson().Contains("relay_cycle"), "the fuse report names the relay loop");
             Expect(world.HealthJson().Contains("\"fuse_trips\":1"), "health counts the trip");
 
+            // Templates: a computer from the catalogue, attached to the Wi-Fi, reachable inside.
+            var built = world.BuildComputer("pc-9", new[] { "fileman", "net-scan" }, new[] { "wifi" });
+            var pc9 = built.Match(
+                built: b => b.Root,
+                invalidName: e => throw new Exception(e.Reason),
+                invalidSpec: e => throw new Exception(e.Reason),
+                unknownTemplate: e => throw new Exception(e.Reason));
+            Expect(world.Connect(root, pc9, wifi) is ConnectResult.Connected, "template computer connected");
+            var snapshot = world.SnapshotJson();
+            Expect(snapshot.Contains("\"name\":\"pc-9\"") && snapshot.Contains("\"name\":\"drive-bay\""), "template computer built");
+            Expect(EmergenceLibrary.TemplatesCatalogJson.Contains("net-scan"), "catalogue lists apps");
+            var doom = world.BuildComputer("pc-10", new[] { "doom" });
+            Expect(doom is BuildResult.InvalidSpec s1 && s1.Reason.Contains("doom"),
+                "an unknown app is an InvalidSpec result that explains itself");
+
+            // One step: a name clash means nothing is added. Two steps: the node stays built.
+            var nodesBefore = CountNodes(world);
+            var clash = world.BuildComputerAt("pc-9", root, wifi);
+            Expect(clash is BuildAtResult.NameConflict, $"one-step clash is a NameConflict (got {clash.GetType().Name})");
+            Expect(CountNodes(world) == nodesBefore, "one-step failure leaves nothing behind");
+            var twin = (BuildResult.Built)world.BuildComputer("pc-9");
+            Expect(world.Connect(root, twin.Root, wifi) is ConnectResult.NameConflict, "two-step connect clash");
+            Expect(CountNodes(world) > nodesBefore, "two-step: the built node stays");
+            Expect(world.RemoveNode(twin.Root) is RemoveResult.Removed, "and can be removed");
+            Expect(CountNodes(world) == nodesBefore, "removing it removes everything inside");
+            Expect(world.RemoveNode(twin.Root) is RemoveResult.NotFound, "removing twice is NotFound");
+            Expect(world.RemoveNode(root) is RemoveResult.IsRoot, "the root cannot be removed");
+            var added = world.BuildComputerAt("pc-11", root, wifi, new[] { "mail" });
+            Expect(added.Match(
+                added: _ => true,
+                invalidName: _ => false,
+                invalidSpec: _ => false,
+                unknownTemplate: _ => false,
+                nameConflict: _ => false,
+                cannotPlace: _ => false), "one-step add succeeds");
+
             try
             {
                 world.CreateNode("bad@name", "x");
@@ -90,15 +138,7 @@ internal static class Program
                 Expect(e.Status == "UnknownLogic", $"unknown logic status (got {e.Status})");
             }
 
-            try
-            {
-                world.Connect(app, pc);
-                Expect(false, "giving a node a second parent throws");
-            }
-            catch (EmergenceException e)
-            {
-                Expect(e.Status == "AlreadyHasParent", $"second-parent error status (got {e.Status})");
-            }
+            Expect(world.Connect(app, pc) is ConnectResult.AlreadyHasParent, "a second parent is refused");
         }
 
         var disposed = new World();

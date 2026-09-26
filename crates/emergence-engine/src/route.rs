@@ -37,7 +37,6 @@ impl Hop {
 
 /// Why a route could not be built.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum RouteError {
     /// A route needs at least one hop.
     Empty,
