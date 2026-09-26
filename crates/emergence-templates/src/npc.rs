@@ -1,6 +1,9 @@
-//! The NPC template. Today one flat node, as in the design docs' MVP: a schedule, dialogue, and
-//! a reaction to being seen. Memory and inventory sub-nodes can be added later without changing
-//! how callers build or use an NPC.
+//! The NPC template: the base every NPC shares, one flat node with a schedule and dialogue.
+//!
+//! What makes one NPC different from another (how it reacts to the player, whether it patrols,
+//! what it guards) is not decided yet, and lives in the host until it is. The plan is for NPCs to
+//! be described by properties, such as being able to patrol, rather than by fixed roles. Memory
+//! and inventory sub-nodes can be added later without changing how callers build or use an NPC.
 
 use emergence_engine::{
     Context, ControllerLogic, Event, LinkId, NodeId, Packet, PacketRoute, World, builtin_events,
@@ -15,39 +18,8 @@ pub mod events {
     pub const TALK: &str = "talk";
     /// An NPC's line of dialogue, sent back to whoever talked to it.
     pub const SAY: &str = "say";
-    /// Sent to an NPC by the host when it sees the player. Detection itself is the host's job
-    /// (it is spatial); reacting to it is the NPC's.
-    pub const PLAYER_SEEN: &str = "player-seen";
-    /// Broadcast by a guard that has seen the player.
-    pub const ALARM: &str = "alarm";
     /// Broadcast whenever an NPC's goal changes, so the host can move it.
     pub const GOAL: &str = "goal";
-}
-
-/// What kind of NPC this is, which decides how it reacts to seeing the player.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
-pub enum NpcRole {
-    /// Raises the alarm when it sees the player.
-    Guard,
-    /// Flees when it sees the player.
-    #[default]
-    Civilian,
-}
-
-impl NpcRole {
-    /// Every role.
-    pub const ALL: &[Self] = &[Self::Guard, Self::Civilian];
-
-    /// The role's name, such as `"guard"`.
-    #[must_use]
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Guard => "guard",
-            Self::Civilian => "civilian",
-        }
-    }
 }
 
 /// Parameters for [`build_npc`].
@@ -55,8 +27,6 @@ impl NpcRole {
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct NpcSpec {
-    /// How it reacts to seeing the player.
-    pub role: NpcRole,
     /// Ticks in one day of its schedule.
     pub day_length: u64,
     /// `(tick of the day, goal)` pairs in order, starting at 0. The goal is a free-form name
@@ -69,7 +39,6 @@ pub struct NpcSpec {
 impl Default for NpcSpec {
     fn default() -> Self {
         Self {
-            role: NpcRole::default(),
             day_length: 240,
             schedule: vec![
                 (0, "sleep".into()),
@@ -203,12 +172,7 @@ impl ControllerLogic for Npc {
             .rev()
             .find(|(start, _)| *start <= time)
             .map(|(_, goal)| goal.clone());
-        // "flee" overrides the schedule until the next scheduled change.
-        let fleeing = self.goal.as_deref() == Some("flee");
-        let scheduled_change = self.spec.schedule.iter().any(|(start, _)| *start == time);
-        if let Some(goal) = goal
-            && (!fleeing || scheduled_change)
-        {
+        if let Some(goal) = goal {
             self.set_goal(&goal, ctx);
         }
     }
@@ -220,14 +184,6 @@ impl ControllerLogic for Npc {
                 self.next_line += 1;
                 let _ = ctx.reply(packet, Event::with_data(events::SAY, line));
             }
-            events::PLAYER_SEEN => match self.spec.role {
-                NpcRole::Guard => {
-                    let who = ctx.name().to_owned();
-                    ctx.note("saw the player: raising the alarm");
-                    broadcast(ctx, &Event::with_data(events::ALARM, who));
-                }
-                NpcRole::Civilian => self.set_goal("flee", ctx),
-            },
             builtin_events::PING => {
                 let pong = Event::with_data(builtin_events::PONG, packet.event().data.clone());
                 let _ = ctx.reply(packet, pong);

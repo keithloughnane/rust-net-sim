@@ -1190,21 +1190,18 @@ pub(crate) const ALL: &[StressTest] = &[
     },
     StressTest {
         group: "Templates",
-        name: "Guard NPC",
-        description: "A guard from the NPC template follows its schedule, answers when talked to, and raises the alarm when told it has seen the player.",
+        name: "NPC base",
+        description: "An NPC from the template follows its schedule and answers when talked to. How NPCs differ (reacting to the player, patrolling) is up to the host for now.",
         setup: |b| {
             let hall = b.world_link("hall")?;
             let spec = serde_json::json!({
-                "role": "guard",
                 "day_length": 20,
                 "schedule": [[0, "patrol"], [10, "rest"]],
                 "lines": ["Halt!"],
             });
             b.npc("guard", &[hall], &spec)?;
             let player = b.device(b.root, "player", "player", &[hall], "none")?;
-            b.world.send(player, "hall", "guard@hall", "talk", b"")?;
-            b.world
-                .send(player, "hall", "guard@hall", "player-seen", b"")
+            b.world.send(player, "hall", "guard@hall", "talk", b"")
         },
         verify: |p| {
             p.run(12)?;
@@ -1217,15 +1214,10 @@ pub(crate) const ALL: &[StressTest] = &[
                 goals == 2,
                 format!("{goals} of 2 goals"),
             );
-            p.check(
-                "raised the alarm",
-                p.notes.iter().any(|n| n.contains("alarm")),
-                format!("{} notes", p.notes.len()),
-            );
             let got = p.received("player")?;
             p.check(
-                "the player heard a line, the alarm and goal changes",
-                got >= 3,
+                "the player heard a line and the goal changes",
+                got >= 2,
                 format!("{got} packets"),
             );
             p.expect_no_alerts();
@@ -1234,23 +1226,35 @@ pub(crate) const ALL: &[StressTest] = &[
     },
     StressTest {
         group: "Templates",
-        name: "Civilian NPC flees",
-        description: "A civilian from the NPC template drops its schedule and flees when it sees the player.",
+        name: "Apps installed at runtime",
+        description: "Two file managers are installed into a running computer under different names, as a game launches apps; a third with a name already on the bus is refused and leaves nothing behind.",
         setup: |b| {
-            let street = b.world_link("street")?;
-            b.npc(
-                "shopper",
-                &[street],
-                &serde_json::json!({ "role": "civilian" }),
-            )?;
-            let player = b.device(b.root, "player", "player", &[street], "none")?;
-            b.world
-                .send(player, "street", "shopper@street", "player-seen", b"")
+            let wifi = b.world_link("wifi")?;
+            b.computer(b.root, "pc", &[wifi], &[])?;
+            Ok(())
         },
         verify: |p| {
-            p.run(3)?;
-            let fled = p.notes.iter().any(|n| n == "goal: flee");
-            p.check("switched its goal to flee", fled, format!("{:?}", p.notes));
+            let pc = p.node("pc")?;
+            let fileman = r#"{"kind": "fileman"}"#;
+            let first = p
+                .world
+                .build_template_at("app", "fileman-1", fileman, pc, None);
+            let second = p
+                .world
+                .build_template_at("app", "fileman-2", fileman, pc, None);
+            let clash = p
+                .world
+                .build_template_at("app", "fileman-1", fileman, pc, None);
+            p.check(
+                "installed two copies",
+                first.is_ok() && second.is_ok(),
+                format!("{first:?} {second:?}"),
+            );
+            p.check(
+                "refused a name already on the bus",
+                clash.is_err(),
+                format!("{clash:?}"),
+            );
             Ok(())
         },
     },

@@ -726,14 +726,13 @@ pub extern "C" fn emergence_logic_kinds_json() -> *const c_char {
 /// { "templates": [{"name": "computer", "description": "..."}, ...],
 ///   "apps": [{"name": "fileman", "title": "File manager"}, ...],
 ///   "hardware": ["wifi", "modem", "promiscuous-nic"],
-///   "npc_roles": ["guard", "civilian"],
 ///   "base_services": ["login-manager", ...],
 ///   "defaults": {"computer": {...spec...}, "npc": {...spec...}} }
 /// ```
 #[unsafe(no_mangle)]
 pub extern "C" fn emergence_templates_catalog_json() -> *const c_char {
     use emergence_templates::{
-        AppKind, BASE_SERVICES, ComputerSpec, HardwareTag, NpcRole, NpcSpec, TEMPLATES,
+        AppKind, BASE_SERVICES, ComputerSpec, HardwareTag, NpcSpec, TEMPLATES,
     };
     use serde_json::json;
     static CATALOG: OnceLock<CString> = OnceLock::new();
@@ -749,7 +748,6 @@ pub extern "C" fn emergence_templates_catalog_json() -> *const c_char {
                     .map(|a| json!({ "name": a.name(), "title": a.title() }))
                     .collect::<Vec<_>>(),
                 "hardware": HardwareTag::ALL.iter().map(|h| h.name()).collect::<Vec<_>>(),
-                "npc_roles": NpcRole::ALL.iter().map(|r| r.name()).collect::<Vec<_>>(),
                 "base_services": BASE_SERVICES.iter().map(|(name, _)| name).collect::<Vec<_>>(),
                 "defaults": { "computer": ComputerSpec::default(), "npc": NpcSpec::default() },
             });
@@ -866,9 +864,15 @@ fn build_template(
     at: Option<emergence_templates::Placement>,
 ) -> Result<NodeId, (EmergenceStatus, String)> {
     use emergence_templates::{
-        ComputerSpec, NpcSpec, TemplateError, build_computer, build_computer_at, build_npc,
-        build_npc_at,
+        AppKind, ComputerSpec, NpcSpec, TemplateError, build_computer, build_computer_at,
+        build_npc, build_npc_at, install_app,
     };
+    /// The spec of the `app` template: which app from the catalogue.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct AppSpec {
+        kind: AppKind,
+    }
     fn parse<T: serde::de::DeserializeOwned + Default>(
         json: &str,
     ) -> Result<T, (EmergenceStatus, String)> {
@@ -878,48 +882,7 @@ fn build_template(
                 .map_err(|e| (EmergenceStatus::InvalidSpec, format!("invalid spec: {e}"))),
         }
     }
-    let describe = |world: &World, e: &TemplateError| -> String {
-        let node_name = |id| {
-            world
-                .network()
-                .node(id)
-                .map_or("?", ControlNode::name)
-                .to_owned()
-        };
-        let link_name = |id| world.network().link(id).map_or("?", Link::name).to_owned();
-        match e {
-            TemplateError::Network(NetworkError::NameConflict { with, .. }) => format!(
-                "`{name}` is already the name of {} on that link",
-                node_name(*with)
-            ),
-            TemplateError::Network(NetworkError::LinkOwnedElsewhere(link)) => format!(
-                "link `{}` already belongs to another node",
-                link_name(*link)
-            ),
-            TemplateError::Network(NetworkError::LinkNameConflict { with, .. }) => format!(
-                "there is already a link called `{}` there",
-                link_name(*with)
-            ),
-            TemplateError::Network(NetworkError::UnknownNode(_)) => {
-                "the parent node does not exist".into()
-            }
-            TemplateError::Network(NetworkError::UnknownLink(_)) => {
-                "the link does not exist".into()
-            }
-            other => other.to_string(),
-        }
-    };
-    let status = |world: &World, e: TemplateError| -> (EmergenceStatus, String) {
-        let why = describe(world, &e);
-        let status = match e {
-            TemplateError::AppInstalledTwice(_)
-            | TemplateError::NameUsedInside(_)
-            | TemplateError::Npc(_) => EmergenceStatus::InvalidSpec,
-            TemplateError::Network(n) => n.into(),
-            TemplateError::Logic(l) => l.into(),
-        };
-        (status, why)
-    };
+    let status = |world: &World, e: TemplateError| template_status(world, name, e);
     match template {
         "computer" => {
             let spec = parse::<ComputerSpec>(spec)?;
@@ -928,6 +891,23 @@ fn build_template(
                 None => build_computer(world, name, &spec),
             }
             .map_err(|e| status(world, e))
+        }
+        "app" => {
+            let spec: AppSpec = serde_json::from_str(spec).map_err(|e| {
+                (
+                    EmergenceStatus::InvalidSpec,
+                    format!(
+                        "invalid spec: {e} (an app needs {{\"kind\": \"fileman\"}} or similar)"
+                    ),
+                )
+            })?;
+            let Some(at) = at else {
+                return Err((
+                    EmergenceStatus::InvalidSpec,
+                    "an app is installed into a computer: build it at the computer".into(),
+                ));
+            };
+            install_app(world, at.parent, spec.kind, Some(name)).map_err(|e| status(world, e))
         }
         "npc" => {
             let spec = parse::<NpcSpec>(spec)?;
@@ -942,6 +922,53 @@ fn build_template(
             format!("no template named `{template}`"),
         )),
     }
+}
+
+/// A template error's status code and a reason for people, naming what clashed.
+fn template_status(
+    world: &World,
+    name: &str,
+    e: emergence_templates::TemplateError,
+) -> (EmergenceStatus, String) {
+    use emergence_templates::TemplateError;
+    let node_name = |id| {
+        world
+            .network()
+            .node(id)
+            .map_or("?", ControlNode::name)
+            .to_owned()
+    };
+    let link_name = |id| world.network().link(id).map_or("?", Link::name).to_owned();
+    let why = match &e {
+        TemplateError::Network(NetworkError::NameConflict { with, .. }) => format!(
+            "`{name}` is already the name of {} on that link",
+            node_name(*with)
+        ),
+        TemplateError::Network(NetworkError::LinkOwnedElsewhere(link)) => format!(
+            "link `{}` already belongs to another node",
+            link_name(*link)
+        ),
+        TemplateError::Network(NetworkError::LinkNameConflict { with, .. }) => format!(
+            "there is already a link called `{}` there",
+            link_name(*with)
+        ),
+        TemplateError::Network(NetworkError::UnknownNode(_)) => {
+            "the parent node does not exist".into()
+        }
+        TemplateError::Network(NetworkError::UnknownLink(_)) => "the link does not exist".into(),
+        other => other.to_string(),
+    };
+    let status = match e {
+        TemplateError::AppInstalledTwice(_)
+        | TemplateError::NameUsedInside(_)
+        | TemplateError::NameUsedTwice(_)
+        | TemplateError::Npc(_) => EmergenceStatus::InvalidSpec,
+        // The parent has no ipc bus to install into: a placement problem.
+        TemplateError::NotAComputer(_) => EmergenceStatus::UnknownLink,
+        TemplateError::Network(n) => n.into(),
+        TemplateError::Logic(l) => l.into(),
+    };
+    (status, why)
 }
 
 /// Returns a description of the last error on this world that had more to say than its status
@@ -1983,6 +2010,65 @@ mod tests {
             serde_json::from_slice(catalog.to_bytes()).unwrap_or_default();
         assert_eq!(catalog["templates"][0]["name"], "computer");
         assert!(catalog["defaults"]["npc"]["lines"].is_array());
+    }
+
+    #[test]
+    fn apps_are_installed_into_a_computer_through_the_abi() {
+        let world = TestWorld::new();
+        let (mut pc, mut app) = (EmergenceNodeId { raw: 0 }, EmergenceNodeId { raw: 0 });
+        let none = EmergenceLinkId { raw: 0 };
+        // SAFETY: live world, NUL-terminated strings, valid out-pointers.
+        unsafe {
+            let spec = c"{\"services\": [\"LoginMan\"]}";
+            assert_eq!(
+                emergence_template_build(
+                    world.0,
+                    c"computer".as_ptr(),
+                    c"pc".as_ptr(),
+                    spec.as_ptr(),
+                    &raw mut pc
+                ),
+                EmergenceStatus::Ok
+            );
+            let install = |kind: &CStr, name: &CStr, parent, out: *mut EmergenceNodeId| {
+                emergence_template_build_at(
+                    world.0,
+                    c"app".as_ptr(),
+                    name.as_ptr(),
+                    kind.as_ptr(),
+                    parent,
+                    none,
+                    out,
+                )
+            };
+            assert_eq!(
+                install(c"{\"kind\": \"fileman\"}", c"fileman-1", pc, &raw mut app),
+                EmergenceStatus::Ok
+            );
+            assert_eq!(
+                install(c"{\"kind\": \"fileman\"}", c"fileman-1", pc, &raw mut app),
+                EmergenceStatus::NameConflict
+            );
+            assert_eq!(
+                install(c"{\"kind\": \"nonsense\"}", c"x", pc, &raw mut app),
+                EmergenceStatus::InvalidSpec
+            );
+            assert_eq!(
+                install(c"{\"kind\": \"mail\"}", c"mail", app, &raw mut app),
+                EmergenceStatus::UnknownLink,
+                "an app is not a computer"
+            );
+        }
+        let names: Vec<String> = world.snapshot()["nodes"]
+            .as_array()
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .filter_map(|n| n["name"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(names.contains(&"LoginMan".to_owned()) && names.contains(&"fileman-1".to_owned()));
     }
 
     #[test]

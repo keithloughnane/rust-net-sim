@@ -252,7 +252,6 @@ namespace Emergence.Native
         ///  { "templates": [{"name": "computer", "description": "..."}, ...],
         ///    "apps": [{"name": "fileman", "title": "File manager"}, ...],
         ///    "hardware": ["wifi", "modem", "promiscuous-nic"],
-        ///    "npc_roles": ["guard", "civilian"],
         ///    "base_services": ["login-manager", ...],
         ///    "defaults": {"computer": {...spec...}, "npc": {...spec...}} }
         ///  ```

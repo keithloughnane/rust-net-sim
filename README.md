@@ -80,19 +80,29 @@ builder per kind of thing, each with its own parameters, each returning a comple
 subtree for the caller to connect wherever it belongs. Callers get the root and use it like any
 node; what's inside can grow without breaking them.
 
-- **`build_computer(world, name, ComputerSpec { apps, hardware })`**: a `kernel` root (the
-  computer's gateway) with an `ipc` bus, the five system services every computer has
-  (`login-manager`, `registry`, `desktop`, `hid-serv`, `drive-bay`) and one node per installed app.
-  Apps come from a fixed catalogue (`AppKind`: `fileman`, `net-scan`, `mail`, `crypt-cracker`, …).
-  Hardware tags: `wifi`, `modem`, `promiscuous-nic`. Today only `promiscuous-nic` changes
-  behaviour: the kernel overhears all traffic on its links.
-- **`build_npc(world, name, NpcSpec { role, day_length, schedule, lines })`**: the MVP from the
-  docs, one node with a schedule (it broadcasts `goal` changes for the host to act on), dialogue
-  (`talk` → `say`), and a reaction to `player-seen`: guards raise the `alarm`, civilians `flee`.
-  Detecting the player is the host's job; reacting is the NPC's.
+It holds reusable, long-lived things only, configured by the host. What is specific to one game,
+or still being worked out (particular servers, how NPCs differ from each other), stays in the game
+until it has settled.
+
+- **`build_computer(world, name, ComputerSpec { services, apps, hardware })`**: a `kernel` root
+  (the computer's gateway) with an `ipc` bus, its system services and one node per installed app.
+  `services` are names chosen by the host, so the nodes match the addresses its software uses; left
+  out, a computer gets the default five (`login-manager`, `registry`, `desktop`, `hid-serv`,
+  `drive-bay`). Apps come from a generic catalogue (`AppKind`: `fileman`, `net-scan`, `mail`,
+  `bbs-client`, `dialer`, `crypt-cracker`, …). Hardware tags: `wifi`, `modem`, `promiscuous-nic`.
+  Today only `promiscuous-nic` changes behaviour: the kernel overhears all traffic on its links.
+- **`install_app(world, computer, app, name)`**: installs one app from the catalogue into a
+  computer that is already running, the way a game launches apps. Several copies can run under
+  different names. Template `"app"` over the C ABI, built at the computer with spec
+  `{"kind": "fileman"}`.
+- **`build_npc(world, name, NpcSpec { day_length, schedule, lines })`**: the base every NPC
+  shares, one node with a schedule (it broadcasts `goal` changes for the host to act on) and
+  dialogue (`talk` → `say`). How NPCs differ from each other (reacting to the player, patrolling)
+  is not decided yet and is up to the host; the plan is to describe NPCs by properties rather
+  than fixed roles.
 
 Over the C ABI: `emergence_templates_catalog_json()` describes everything (templates, apps,
-hardware, roles, default specs) and `emergence_template_build(world, "computer", name, spec_json,
+hardware, default specs) and `emergence_template_build(world, "computer", name, spec_json,
 &root)` builds one; `emergence_world_last_error` explains a rejected spec. The C# wrapper has
 `BuildTemplate` and `BuildComputer`. The demo scenarios build their computers and NPCs from the
 templates.
@@ -226,7 +236,7 @@ cargo ctl step 20                       # stops early, and explains, if the fuse
 cargo ctl run                           # run the whole checklist and print the results
 cargo ctl templates                     # what the templates library can build
 cargo ctl add computer pc-lab --link office-wifi --apps fileman,net-scan --hardware promiscuous-nic
-cargo ctl add npc bob --link office-lan --role guard --say "Halt!|Move along."
+cargo ctl add npc bob --link office-lan --say "Halt!|Move along."
 cargo ctl remove pc-lab
 cargo ctl screenshot window.png         # save a picture of the window
 cargo ctl help                          # every command

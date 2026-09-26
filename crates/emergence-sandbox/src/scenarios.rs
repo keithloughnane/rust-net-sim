@@ -197,17 +197,12 @@ fn office(b: &mut Builder<'_>) -> BuildResult {
     b.device(player, "phone", "phone", &[pan, street], BEACON)?;
 
     let guard = serde_json::json!({
-        "role": "guard",
         "day_length": 96,
         "schedule": [[0, "patrol"], [48, "check-doors"]],
         "lines": ["Move along.", "Office is closed after six."],
     });
     b.npc("npc-guard", &[npc_range, street], &guard)?;
-    b.npc(
-        "npc-cleaner",
-        &[npc_range],
-        &serde_json::json!({ "role": "civilian" }),
-    )?;
+    b.npc("npc-cleaner", &[npc_range], &serde_json::json!({}))?;
     Ok(())
 }
 

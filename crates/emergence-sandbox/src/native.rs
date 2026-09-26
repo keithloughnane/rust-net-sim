@@ -45,7 +45,6 @@ pub(crate) struct TemplateCatalog {
     pub(crate) templates: Vec<TemplateInfo>,
     pub(crate) apps: Vec<AppInfo>,
     pub(crate) hardware: Vec<String>,
-    pub(crate) npc_roles: Vec<String>,
     pub(crate) defaults: serde_json::Value,
 }
 
